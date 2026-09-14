@@ -1,0 +1,6 @@
+{
+  "name": "Great Coders",
+  "description": "Great Coders is a focused coding challenge platform for daily execution, DSA practice, discipline, and consistent improvement.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

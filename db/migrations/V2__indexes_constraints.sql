@@ -1,0 +1,13 @@
+CREATE INDEX idx_authentication_identities_participant ON authentication_identities(participant_id);
+CREATE INDEX idx_challenge_days_challenge_date ON challenge_days(challenge_id, calendar_date);
+CREATE INDEX idx_curriculum_tasks_day_subject ON curriculum_tasks(challenge_day_id, subject_id);
+CREATE INDEX idx_task_completions_participant_status ON task_completions(participant_id, status);
+CREATE INDEX idx_dsa_submissions_participant_date ON dsa_submissions(participant_id, submission_date);
+CREATE INDEX idx_points_ledger_participant_date ON points_ledger(participant_id, created_at);
+CREATE INDEX idx_wake_up_checkins_participant_day ON wake_up_checkins(participant_id, challenge_day_id);
+CREATE INDEX idx_self_control_participant_day ON self_control_entries(participant_id, challenge_day_id);
+CREATE INDEX idx_holidays_participant_challenge ON holidays(participant_id, challenge_id);
+CREATE INDEX idx_todays_live_participant_day ON todays_live(participant_id, challenge_day_id);
+CREATE INDEX idx_change_requests_target_status ON change_requests(target_id, status);
+CREATE INDEX idx_audit_logs_entity_created ON audit_logs(entity_type, entity_id, created_at);
+CREATE INDEX idx_notifications_recipient_read ON notifications(recipient_participant_id, read_at, created_at);

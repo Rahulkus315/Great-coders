@@ -1,0 +1,2655 @@
+import express from 'express';
+import bcrypt from 'bcryptjs';
+import { OAuth2Client } from 'google-auth-library';
+import { getRuntimePool, store } from './store';
+import { calculateDayInfo, getISTDateString, getISTNow } from './timeUtils';
+import {
+  calculateUserStats,
+  calculateHabitStats,
+  getCompetitionOverview,
+  calculateCheckinStats,
+} from './scoringEngine';
+import {
+  checkPermissionCooldown,
+  createPermissionRequest,
+  handlePermissionResponse,
+} from './permissionEngine';
+import { settleMorningCheckinsForDate } from './settlementEngine';
+import { finalizeFocusedExecution } from './focusedExecutionLock';
+import { completeTask, completeTaskSection, TaskCompletionError, undoTaskSection } from './taskCompletionService';
+import { getWakeUpCheckin, getWakeUpStats, recordWakeUpCheckin, WakeUpCheckinError } from './wakeUpCheckinService';
+import { applyLeave, DailyActivityError, getDailyCheckinStats, listLeaves, recordDailyCheckin } from './dailyActivityService';
+import { DsaServiceError, getDsaAttempt, recordDsaAttempt } from './dsaService';
+import { getHabitData, HabitJournalError, recordRelapse, getJournalData, saveJournal } from './habitJournalService';
+import { listAuditLogs, listLedger, listNotifications, markAllNotificationsRead, markNotificationRead } from './notificationService';
+import { ScheduleSection, SubjectCategory } from '../src/types';
+import type { AppState } from './store';
+
+const DAILY_SCHEDULE_SECTIONS: ScheduleSection[] = ['DSA', 'JAVA', 'OS', 'DBMS'];
+const SECTION_POINTS: Record<ScheduleSection, number> = { DSA: 10, JAVA: 10, OS: 8, DBMS: 8 };
+const SECTION_CATEGORIES: Record<ScheduleSection, SubjectCategory> = {
+  DSA: 'DSA',
+  JAVA: 'CORE_JAVA',
+  OS: 'OS',
+  DBMS: 'DBMS',
+};
+
+const googleClientId = process.env.GOOGLE_CLIENT_ID || '';
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET || '';
+const googleRedirectUri = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/auth/google/callback';
+const googleClient = googleClientId ? new OAuth2Client(googleClientId, googleClientSecret, googleRedirectUri) : null;
+
+function setAuthCookie(res: express.Response, userId: string) {
+  const secure = process.env.NODE_ENV === 'production';
+  res.cookie('session_user_id', userId, {
+    httpOnly: true,
+    secure,
+    sameSite: 'lax',
+    maxAge: 1000 * 60 * 60 * 24 * 30,
+  });
+}
+
+function clearAuthCookie(res: express.Response) {
+  const secure = process.env.NODE_ENV === 'production';
+  res.clearCookie('session_user_id', {
+    httpOnly: true,
+    secure,
+    sameSite: 'lax',
+  });
+}
+
+function getSessionUserId(req: express.Request) {
+  const sessionId = req.cookies?.session_user_id;
+  if (typeof sessionId === 'string' && (sessionId === 'user-rahul' || sessionId === 'user-dileep')) {
+    return sessionId;
+  }
+  return null;
+}
+
+function getDefaultProfile(user: { id: string; name: string; avatar: string; targetRole?: string }) {
+  return {
+    displayName: user.name,
+    headline: user.targetRole || 'DSA • Java OOP • OS • DBMS',
+    bio: 'Building every day. Becoming a better coder.',
+    skills: 'DSA • Java • Operating Systems • DBMS • Collections',
+    coverTheme: 'default' as const,
+    avatarUrl: user.avatar,
+  };
+}
+
+export const apiRouter = express.Router();
+
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+function isAllowedRequestOrigin(req: express.Request) {
+  const origin = req.get('origin') || (req.get('referer') ? new URL(req.get('referer')!).origin : '');
+  if (!origin) return process.env.NODE_ENV !== 'production';
+  const configured = (process.env.APP_ORIGIN || '').split(',').map(value => value.trim()).filter(Boolean);
+  const allowed = new Set(configured.length ? configured : ['http://localhost:3000', 'http://localhost:5173']);
+  return allowed.has(origin);
+}
+
+apiRouter.use((req, res, next) => {
+  if (MUTATING_METHODS.has(req.method) && !isAllowedRequestOrigin(req)) {
+    return res.status(403).json({ error: 'Cross-site request rejected.' });
+  }
+
+  if (req.path === '/auth/login' && req.method === 'POST') {
+    const key = req.ip || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    const attempt = loginAttempts.get(key);
+    if (!attempt || attempt.resetAt <= now) {
+      loginAttempts.set(key, { count: 1, resetAt: now + 15 * 60 * 1000 });
+    } else if (attempt.count >= 10) {
+      return res.status(429).json({ error: 'Too many login attempts. Please try again later.' });
+    } else {
+      attempt.count += 1;
+    }
+  }
+
+  const sessionUserId = getSessionUserId(req);
+  const clientUserIdHeader = typeof req.headers['x-user-id'] === 'string' ? req.headers['x-user-id'] : null;
+  const bodyUserId = typeof (req.body as any)?.userId === 'string' ? (req.body as any).userId : null;
+
+  if (clientUserIdHeader && sessionUserId && clientUserIdHeader !== sessionUserId) {
+    return res.status(403).json({
+      error: 'Identity mismatch: client header does not match the authenticated server session.',
+    });
+  }
+
+  if (clientUserIdHeader && !sessionUserId) {
+    return res.status(401).json({
+      error: 'Client identity headers are forbidden unless a valid authenticated session exists.',
+    });
+  }
+
+  if (bodyUserId && sessionUserId && bodyUserId !== sessionUserId) {
+    return res.status(403).json({
+      error: 'Identity mismatch: submitted userId does not match the authenticated session.',
+    });
+  }
+
+  next();
+});
+
+// Middleware: trust only the server-authenticated session cookie.
+function getAuthUser(req: express.Request) {
+  const state = store.getState();
+  const sessionUserId = getSessionUserId(req);
+  if (!sessionUserId) {
+    return null;
+  }
+
+  return state.users.find(u => u.id === sessionUserId) || null;
+}
+
+function requireAuthUser(req: express.Request, res: express.Response) {
+  const user = getAuthUser(req);
+  if (!user) {
+    res.status(401).json({ error: 'Authentication required.' });
+    return null;
+  }
+  return user;
+}
+
+export function buildUserExport(state: AppState, userId: string) {
+  const user = state.users.find(candidate => candidate.id === userId);
+  if (!user) return null;
+
+  const { passwordHash: _passwordHash, ...safeUser } = user;
+  return {
+    user: safeUser,
+    profile: state.profiles?.[userId] || null,
+    curriculum: {
+      tasks: state.tasks,
+      dsaProblems: state.dsaProblems,
+      interviewQuestions: state.interviewQuestions,
+      quotes: state.quotes,
+    },
+    taskStatuses: state.taskStatuses.filter(item => item.userId === userId),
+    scheduleSectionStatuses: state.scheduleSectionStatuses.filter(item => item.userId === userId),
+    pointLedger: state.pointLedger.filter(item => item.userId === userId),
+    dsaAttempts: state.dsaAttempts.filter(item => item.userId === userId),
+    permissions: state.permissions.filter(item => item.requesterId === userId || item.targetUserId === userId),
+    journals: state.journals.filter(item => item.userId === userId),
+    habits: state.habits.filter(item => item.userId === userId),
+    morningCheckins: state.morningCheckins.filter(item => item.userId === userId),
+    dailyCheckins: state.dailyCheckins.filter(item => item.userId === userId),
+    leaves: state.leaves.filter(item => item.userId === userId),
+    notifications: state.notifications.filter(item => item.userId === userId),
+    auditLogs: state.auditLogs.filter(item => item.actorId === userId),
+    curriculumVersion: state.curriculumVersion,
+  };
+}
+
+// ----------------------------------------------------------------------
+// 1. AUTHENTICATION & IDENTITY LOCKING
+// ----------------------------------------------------------------------
+apiRouter.get('/auth/google/start', (req, res) => {
+  if (!googleClient) {
+    return res.status(500).json({
+      error: 'Google OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI.',
+    });
+  }
+
+  const participantId = req.query.participant === 'user-dileep' ? 'user-dileep' : 'user-rahul';
+  const authUrl = googleClient.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: true,
+    scope: ['openid', 'email', 'profile'],
+    state: JSON.stringify({ participantId }),
+  });
+
+  res.redirect(authUrl);
+});
+
+apiRouter.get('/auth/google/callback', async (req, res) => {
+  try {
+    if (!googleClient) {
+      return res.redirect('/?auth_error=' + encodeURIComponent('Google Sign-In failed. Please try again.'));
+    }
+
+    const { code, state } = req.query as { code?: string; state?: string };
+    if (!code) {
+      return res.redirect('/?auth_error=' + encodeURIComponent('Google Sign-In failed. Please try again.'));
+    }
+
+    let participantId: 'user-rahul' | 'user-dileep' = 'user-rahul';
+    if (state) {
+      try {
+        const parsed = JSON.parse(state);
+        if (parsed.participantId === 'user-dileep' || parsed.participantId === 'user-rahul') {
+          participantId = parsed.participantId;
+        }
+      } catch {
+        // ignore malformed state
+      }
+    }
+
+    const { tokens } = await googleClient.getToken({
+      code: String(code),
+      redirect_uri: googleRedirectUri,
+    });
+
+    if (!tokens.id_token) {
+      throw new Error('Google token exchange did not return an id_token');
+    }
+
+    const ticket = await googleClient.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: googleClientId,
+    });
+
+    const payload = ticket.getPayload();
+    if (!payload || !payload.sub || !payload.email || payload.email_verified === false) {
+      throw new Error('Google identity payload is invalid or email is not verified');
+    }
+
+    const providerSubject = payload.sub;
+    const stateStore = store.getState();
+    const existingIdentity = stateStore.authIdentities.find(
+      auth => auth.provider === 'GOOGLE' && auth.providerSubject === providerSubject
+    );
+
+    if (existingIdentity && existingIdentity.bindingStatus === 'PERMANENT') {
+      const user = stateStore.users.find(u => u.id === existingIdentity.participantId);
+      if (!user) {
+        throw new Error('Bound participant could not be found');
+      }
+      setAuthCookie(res, user.id);
+      stateStore.auditLogs.unshift({
+        id: `audit-google-login-${Date.now()}`,
+        actorId: user.id,
+        actorName: user.name,
+        action: 'LOGIN_SUCCESS',
+        targetType: 'SESSION',
+        targetId: user.id,
+        reason: `Google identity re-identified participant ${user.name} via stable provider subject`,
+        timestamp: getISTNow().toISOString(),
+      });
+      store.save();
+      return res.redirect('/');
+    }
+
+    const boundGoogleIdentities = stateStore.authIdentities.filter(
+      auth => auth.provider === 'GOOGLE' && auth.bindingStatus === 'PERMANENT'
+    );
+    if (boundGoogleIdentities.length >= 2) {
+      return res.redirect('/?auth_error=' + encodeURIComponent('Challenge registration is closed. This challenge supports only Rahul and Dileep.'));
+    }
+
+    const subjectAlreadyBoundToAnotherParticipant = stateStore.authIdentities.some(
+      auth => auth.provider === 'GOOGLE' && auth.providerSubject === providerSubject && auth.bindingStatus === 'PERMANENT' && auth.participantId !== participantId
+    );
+    if (subjectAlreadyBoundToAnotherParticipant) {
+      return res.redirect('/?auth_error=' + encodeURIComponent('This Google account is already permanently associated with another challenge participant.'));
+    }
+
+    const participantAlreadyBound = stateStore.authIdentities.some(
+      auth => auth.provider === 'GOOGLE' && auth.bindingStatus === 'PERMANENT' && auth.participantId === participantId
+    );
+    if (participantAlreadyBound) {
+      return res.redirect('/?auth_error=' + encodeURIComponent('This participant already has a permanently bound Google identity.'));
+    }
+
+    const bindTarget = stateStore.users.find(u => u.id === participantId);
+    if (!bindTarget) {
+      return res.redirect('/?auth_error=' + encodeURIComponent('Requested challenge participant could not be found.'));
+    }
+
+    const pendingPayload = {
+      participantId,
+      providerSubject,
+      email: payload.email,
+      name: payload.name || bindTarget.name,
+      emailVerified: !!payload.email_verified,
+    };
+
+    res.cookie('pending_google_bind', JSON.stringify(pendingPayload), {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 5 * 60 * 1000,
+    });
+
+    return res.redirect(
+      '/?auth=bind&participant=' + participantId + '&providerSubject=' + encodeURIComponent(providerSubject) + '&email=' + encodeURIComponent(payload.email)
+    );
+  } catch (error: any) {
+    console.error('Google callback error', error);
+    return res.redirect('/?auth_error=' + encodeURIComponent('Google Sign-In failed. Please try again.'));
+  }
+});
+
+apiRouter.post('/auth/google/bind', (req, res) => {
+  try {
+    const { participantId, providerSubject, email } = req.body as {
+      participantId?: string;
+      providerSubject?: string;
+      email?: string;
+    };
+
+    if (!participantId || !providerSubject || !['user-rahul', 'user-dileep'].includes(participantId)) {
+      return res.status(400).json({ error: 'Invalid participant binding request.' });
+    }
+
+    const state = store.getState();
+    const participant = state.users.find(u => u.id === participantId);
+    if (!participant) {
+      return res.status(404).json({ error: 'Participant not found.' });
+    }
+
+    const alreadyBoundBySubject = state.authIdentities.find(
+      auth => auth.provider === 'GOOGLE' && auth.providerSubject === providerSubject
+    );
+    if (alreadyBoundBySubject && alreadyBoundBySubject.bindingStatus === 'PERMANENT') {
+      if (alreadyBoundBySubject.participantId !== participantId) {
+        return res.status(409).json({ error: 'This Google account is already permanently associated with another challenge participant.' });
+      }
+      setAuthCookie(res, participant.id);
+      return res.json({ success: true, user: participant, message: `Welcome back, ${participant.name}.` });
+    }
+
+    const participantAlreadyBound = state.authIdentities.some(
+      auth => auth.provider === 'GOOGLE' && auth.bindingStatus === 'PERMANENT' && auth.participantId === participantId
+    );
+    if (participantAlreadyBound) {
+      return res.status(409).json({ error: 'This challenge participant already has a permanent Google binding.' });
+    }
+
+    const boundGoogleIdentities = state.authIdentities.filter(
+      auth => auth.provider === 'GOOGLE' && auth.bindingStatus === 'PERMANENT'
+    );
+    if (boundGoogleIdentities.length >= 2) {
+      return res.status(403).json({ error: 'Challenge registration is closed. This challenge supports only Rahul and Dileep.' });
+    }
+
+    state.authIdentities = state.authIdentities.filter(
+      auth => !(auth.provider === 'GOOGLE' && auth.providerSubject === providerSubject)
+    );
+
+    const identityEntry = {
+      id: `auth-google-${Date.now()}`,
+      provider: 'GOOGLE' as const,
+      providerSubject,
+      email: String(email || ''),
+      emailVerified: true,
+      participantId: participantId as 'user-rahul' | 'user-dileep',
+      bindingStatus: 'PERMANENT' as const,
+      createdAt: new Date().toISOString(),
+      lastLoginAt: new Date().toISOString(),
+    };
+
+    state.authIdentities.push(identityEntry);
+    setAuthCookie(res, participant.id);
+    state.auditLogs.unshift({
+      id: `audit-google-bind-${Date.now()}`,
+      actorId: participant.id,
+      actorName: participant.name,
+      action: 'PARTICIPANT_BOUND',
+      targetType: 'AUTH_IDENTITY',
+      targetId: identityEntry.id,
+      reason: `Google account permanently bound to ${participant.name} using stable Google subject ${providerSubject}`,
+      timestamp: getISTNow().toISOString(),
+    });
+    store.save();
+
+    const { passwordHash: _passwordHash, ...userClean } = participant;
+    return res.json({
+      success: true,
+      user: userClean,
+      message: `Welcome, ${participant.name}! Your Google account is permanently bound to this challenge identity.`,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Google binding failed.' });
+  }
+});
+
+apiRouter.post('/auth/logout', (req, res) => {
+  clearAuthCookie(res);
+  res.json({ success: true, message: 'Logged out successfully.' });
+});
+
+apiRouter.get('/auth/me', (req, res) => {
+  const user = requireAuthUser(req, res);
+  if (!user) return;
+
+  const { passwordHash, ...userClean } = user;
+  res.json({ user: userClean, authenticated: true });
+});
+
+apiRouter.post('/auth/login', async (req, res) => {
+  const { email, password, googleAuth } = req.body;
+  const emailLower = (email || '').toLowerCase().trim();
+  try {
+    const result = await getRuntimePool().query(
+      `SELECT legacy_id AS id, display_name AS name, email, avatar_url AS avatar, target_role AS "targetRole", bound_identity AS "boundIdentity", password_hash AS "passwordHash"
+       FROM participants WHERE status = 'ACTIVE' AND (lower(email) = $1 OR lower(display_name) = $1 OR legacy_id = $1) LIMIT 1`,
+      [emailLower]
+    );
+    const user = result.rows[0];
+    if (!user) return res.status(403).json({ error: 'Access Denied: participant account not found.' });
+    if (password && !googleAuth && user.passwordHash && !bcrypt.compareSync(password, user.passwordHash)) {
+      return res.status(401).json({ error: 'Invalid password. (Default is password123)' });
+    }
+    await getRuntimePool().query(
+      `INSERT INTO audit_logs (actor_participant_id, action, entity_type, reason, created_at)
+       SELECT id, 'USER_LOGIN', 'SESSION', 'Participant login', $2 FROM participants WHERE legacy_id = $1`,
+      [user.id, getISTNow().toISOString()]
+    );
+    setAuthCookie(res, user.id);
+    const { passwordHash: _passwordHash, ...userClean } = user;
+    return res.json({ user: userClean, message: `Welcome back, ${user.name}! Account locked to your identity.` });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+apiRouter.get('/auth/me', (req, res) => {
+  const user = requireAuthUser(req, res);
+  if (!user) return;
+
+  const { passwordHash, ...userClean } = user;
+  res.json({ user: userClean });
+});
+
+apiRouter.get('/profile', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const result = await getRuntimePool().query(
+      `SELECT p.display_name AS "displayName", p.headline, p.bio, p.skills, p.cover_theme AS "coverTheme", p.avatar_url AS "avatarUrl"
+       FROM profiles p JOIN participants u ON u.id = p.participant_id WHERE u.legacy_id = $1`, [userId]
+    );
+    return res.json({ profile: result.rows[0] || null, userId });
+  } catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+apiRouter.post('/profile', async (req, res) => {
+  const user = requireAuthUser(req, res);
+  if (!user) return;
+
+  const incoming = req.body || {};
+  const safeProfile = {
+    displayName: String(incoming.displayName || user.name).trim().slice(0, 80) || user.name,
+    headline: String(incoming.headline || user.targetRole || 'DSA • Java OOP • OS • DBMS').trim().slice(0, 120),
+    bio: String(incoming.bio || 'Building every day. Becoming a better coder.').trim().slice(0, 160),
+    skills: String(incoming.skills || 'DSA • Java • Operating Systems • DBMS • Collections').trim().slice(0, 220),
+    coverTheme: ['default', 'developer', 'java', 'ai', 'backend', 'fullstack'].includes(incoming.coverTheme) ? incoming.coverTheme : 'default',
+    avatarUrl: typeof incoming.avatarUrl === 'string' && incoming.avatarUrl.trim() ? incoming.avatarUrl.trim() : user.avatar,
+  };
+
+  try {
+    await getRuntimePool().query(
+      `INSERT INTO profiles (participant_id, display_name, headline, bio, skills, avatar_url, cover_theme)
+       SELECT id, $2, $3, $4, $5, $6, $7 FROM participants WHERE legacy_id = $1
+       ON CONFLICT (participant_id) DO UPDATE SET display_name=EXCLUDED.display_name, headline=EXCLUDED.headline, bio=EXCLUDED.bio, skills=EXCLUDED.skills, avatar_url=EXCLUDED.avatar_url, cover_theme=EXCLUDED.cover_theme, updated_at=now()`,
+      [user.id, safeProfile.displayName, safeProfile.headline, safeProfile.bio, safeProfile.skills, safeProfile.avatarUrl, safeProfile.coverTheme]
+    );
+    return res.json({ profile: safeProfile, userId: user.id });
+  } catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+apiRouter.post('/auth/switch-user', (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  return res.status(403).json({
+    error: 'Identity switching is disabled. The active challenge session is fixed to the authenticated participant.',
+  });
+});
+
+// ----------------------------------------------------------------------
+// 2. DASHBOARD & OVERVIEW
+// ----------------------------------------------------------------------
+apiRouter.get('/dashboard', async (req, res) => {
+  try {
+    const currentUser = requireAuthUser(req, res);
+    if (!currentUser) return;
+
+    const state = store.getState();
+    const dayInfo = calculateDayInfo();
+    await settleMorningCheckinsForDate(dayInfo.currentDate);
+    const overview = getCompetitionOverview();
+    const partnerUser = state.users.find(u => u.id !== currentUser.id) || state.users[1];
+    const currentWakeStats = await getWakeUpStats(getRuntimePool(), currentUser.id);
+    const partnerWakeStats = await getWakeUpStats(getRuntimePool(), partnerUser.id);
+
+    state.leaves = state.leaves || [];
+
+    const currentDate = overview.dayInfo.currentDate;
+    const userLeaves = state.leaves.filter(l => l.userId === currentUser.id);
+    const partnerLeaves = state.leaves.filter(l => l.userId === partnerUser.id);
+    const isOnLeaveToday = userLeaves.some(l => l.date === currentDate);
+    const partnerOnLeaveToday = partnerLeaves.some(l => l.date === currentDate);
+
+    // Schedule shift logic: each past approved leave shifts the user's task curriculum forward by 1 day
+    const pastLeavesCount = userLeaves.filter(l => l.date < currentDate).length;
+    const userEffectiveDayNumber = Math.max(1, overview.dayInfo.dayNumber - pastLeavesCount);
+
+    // Attach today's task and DSA for quick view (null if user is on leave today)
+    const todayTask = isOnLeaveToday
+      ? null
+      : state.tasks.find(t => t.dayNumber === userEffectiveDayNumber) || null;
+    const todayDsa = isOnLeaveToday
+      ? null
+      : state.dsaProblems.find(p => p.dayNumber === userEffectiveDayNumber) || null;
+
+    const todayMorningCheckin = await getWakeUpCheckin(getRuntimePool(), currentUser.id, currentDate);
+
+    const taskStatus = todayTask
+      ? state.taskStatuses.find(ts => ts.taskId === todayTask.id && ts.userId === currentUser.id)
+      : null;
+
+    const todaySectionStatuses = Object.fromEntries(
+      DAILY_SCHEDULE_SECTIONS.map(section => [
+        section,
+        state.scheduleSectionStatuses.find(
+          status => status.taskId === todayTask?.id && status.section === section && status.userId === currentUser.id
+        ) || {
+          taskId: todayTask?.id || '',
+          section,
+          userId: currentUser.id,
+          status: 'PENDING',
+          pointsAwarded: 0,
+        },
+      ])
+    ) as Record<ScheduleSection, (typeof state.scheduleSectionStatuses)[number]>;
+    const sectionValues = Object.values(todaySectionStatuses);
+    const todayScheduleStatus = sectionValues.some(status => status.status === 'MISSED')
+      ? 'MISSED'
+      : sectionValues.every(status => status.status === 'COMPLETED_ON_TIME')
+      ? 'COMPLETED_ON_TIME'
+      : sectionValues.every(status => status.status === 'COMPLETED_ON_TIME' || status.status === 'COMPLETED_LATE')
+      ? 'COMPLETED_LATE'
+      : 'PENDING';
+
+    const dsaAttempt = todayDsa
+      ? state.dsaAttempts.find(a => a.problemId === todayDsa.id && a.userId === currentUser.id)
+      : null;
+
+    const notifications = state.notifications.filter(n => n.userId === currentUser.id);
+    const pendingApprovalsForUser = state.permissions.filter(
+      p => p.targetUserId === currentUser.id && p.status === 'PENDING'
+    );
+
+    // Check if reversal cooldown is active for today's task
+    let isReversalBlocked = false;
+    let reversalCooldownText: string | undefined = undefined;
+
+    if (todayTask) {
+      const activeCooldown = state.permissions.find(
+        p =>
+          p.requesterId === currentUser.id &&
+          p.actionType === 'TASK_REVERSAL' &&
+          p.entityId === todayTask.id &&
+          p.status === 'DECLINED' &&
+          p.declinedCooldownUntil &&
+          new Date(p.declinedCooldownUntil).getTime() > Date.now()
+      );
+
+      if (activeCooldown && activeCooldown.declinedCooldownUntil) {
+        isReversalBlocked = true;
+        const diff = new Date(activeCooldown.declinedCooldownUntil).getTime() - Date.now();
+        const hours = Math.floor(diff / (1000 * 60 * 60));
+        const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+        reversalCooldownText = `You can request again in ${hours}h ${minutes}m`;
+      }
+    }
+
+    const { passwordHash: _p1, ...cleanCurrentUser } = currentUser;
+    const { passwordHash: _p2, ...cleanPartnerUser } = partnerUser;
+    const currentProfile = state.profiles?.[currentUser.id] || getDefaultProfile(currentUser);
+    const partnerProfile = state.profiles?.[partnerUser.id] || getDefaultProfile(partnerUser);
+
+    const myCheckinStats = calculateCheckinStats(currentUser.id);
+    const partnerCheckinStats = calculateCheckinStats(partnerUser.id);
+    const myStreak = myCheckinStats.currentStreak;
+    const daysUntilBonus = myStreak > 0 && myStreak % 7 === 0 ? 0 : 7 - (myStreak % 7);
+
+    const dailyCheckinInfo = {
+      myCheckin: myCheckinStats.todayCheckin,
+      partnerCheckin: partnerCheckinStats.todayCheckin,
+      myStreak: myCheckinStats.currentStreak,
+      partnerStreak: partnerCheckinStats.currentStreak,
+      hasCheckedInToday: myCheckinStats.hasCheckedInToday,
+      partnerHasCheckedInToday: partnerCheckinStats.hasCheckedInToday,
+      daysUntilBonus,
+      totalCoins: myCheckinStats.totalCoins,
+      partnerName: partnerUser.name,
+    };
+
+    const currentStats = currentUser.id === 'user-rahul' ? overview.rahul : overview.dileep;
+    const partnerStats = currentUser.id === 'user-rahul' ? overview.dileep : overview.rahul;
+    currentStats.morningCheckinStreak = currentWakeStats.currentStreak;
+    currentStats.bestMorningCheckinStreak = currentWakeStats.bestStreak;
+    currentStats.morningCheckinToday = todayMorningCheckin
+      ? todayMorningCheckin.status as 'CHECKED_IN' | 'MISSED'
+      : (overview.dayInfo.morningWindowStatus === 'CLOSED' ? 'MISSED' : 'PENDING');
+    partnerStats.morningCheckinStreak = partnerWakeStats.currentStreak;
+    partnerStats.bestMorningCheckinStreak = partnerWakeStats.bestStreak;
+
+    res.json({
+      ...overview,
+      currentUser: cleanCurrentUser,
+      partnerUser: cleanPartnerUser,
+      profile: currentProfile,
+      partnerProfile,
+      rahulStats: overview.rahul,
+      dileepStats: overview.dileep,
+      currentUserStats: currentStats,
+      partnerStats,
+      todayTask,
+      todayDsaProblem: todayDsa,
+      todayTaskStatus: todayScheduleStatus,
+      todayDsaSolved: dsaAttempt?.status === 'SOLVED',
+      todaySectionStatuses,
+      todayMorningCheckin,
+      dailyCheckinInfo,
+      userLeaves,
+      partnerLeaves,
+      leavesUsed: userLeaves.length,
+      remainingLeaves: Math.max(0, 5 - userLeaves.length),
+      isOnLeaveToday,
+      partnerOnLeaveToday,
+      userEffectiveDayNumber,
+      notifications,
+      pendingApprovalsForUser,
+      isReversalBlocked,
+      reversalCooldownText,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/tasks/:id/sections/:section/complete', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+
+  try {
+    const result = await completeTaskSection(getRuntimePool(), userId, req.params.id, req.params.section);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    const statusCode = error instanceof TaskCompletionError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+apiRouter.post('/tasks/:id/sections/:section/undo', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+
+  try {
+    const result = await undoTaskSection(getRuntimePool(), userId, req.params.id, req.params.section);
+    return res.json({ success: true, status: 'PENDING', ...result });
+  } catch (error) {
+    const statusCode = error instanceof TaskCompletionError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// ----------------------------------------------------------------------
+// 2A. MORNING WAKE-UP CHECK-IN (04:00 AM - 05:00 AM IST)
+// ----------------------------------------------------------------------
+apiRouter.post('/morning/checkin', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+
+  try {
+    const result = await recordWakeUpCheckin(getRuntimePool(), userId);
+    return res.json({
+      success: true,
+      alreadyCheckedIn: result.alreadyCheckedIn,
+      message: result.alreadyCheckedIn ? `Already checked in today at ${result.checkin.checkedInAt}.` : '🌅 Morning wake-up check-in verified! +2 discipline points awarded.',
+      pointsAwarded: result.alreadyCheckedIn ? 0 : 2,
+      streak: result.stats.currentStreak,
+      checkin: result.checkin,
+    });
+  } catch (error) {
+    const statusCode = error instanceof WakeUpCheckinError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+apiRouter.get('/morning/status', async (req, res) => {
+  try {
+    const userId = getSessionUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+    const dayInfo = calculateDayInfo();
+    const currentDate = dayInfo.currentDate;
+    await settleMorningCheckinsForDate(currentDate);
+    const checkin = await getWakeUpCheckin(getRuntimePool(), userId, currentDate);
+    const stats = await getWakeUpStats(getRuntimePool(), userId);
+    return res.json({
+      date: currentDate,
+      windowStatus: dayInfo.morningWindowStatus,
+      windowOpensAt: '04:00 AM IST',
+      windowClosesAt: '05:00 AM IST',
+      istTime: dayInfo.istTime,
+      checkin,
+      wakeUpStreak: stats.currentStreak,
+      bestWakeUpStreak: stats.bestStreak,
+    });
+  } catch (err: any) {
+    const statusCode = err instanceof WakeUpCheckinError ? err.statusCode : 500;
+    res.status(statusCode).json({ error: err.message });
+  }
+});
+
+apiRouter.get('/morning/history', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const stats = await getWakeUpStats(getRuntimePool(), userId);
+    return res.json({ history: stats.history, wakeUpStreak: stats.currentStreak, bestWakeUpStreak: stats.bestStreak });
+  } catch (error) {
+    const statusCode = error instanceof WakeUpCheckinError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// ----------------------------------------------------------------------
+// 2A-2. GENERAL DAILY CHECK-IN BUTTON (+1 COIN, STREAK + 7-DAY BONUS)
+// ----------------------------------------------------------------------
+apiRouter.post('/checkin', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const result = await recordDailyCheckin(getRuntimePool(), userId);
+    return res.json({
+      success: !result.alreadyCheckedIn,
+      alreadyCheckedIn: result.alreadyCheckedIn,
+      message: result.alreadyCheckedIn ? 'You have already checked in today.' : 'Check-in confirmed! +1 Coin and streak updated.',
+      streak: result.stats.currentStreak,
+      coinsAwarded: result.alreadyCheckedIn ? 0 : 1,
+      checkin: result.checkin,
+      dailyCheckinInfo: { ...result.stats, myCheckin: result.checkin },
+    });
+  } catch (error) {
+    const statusCode = error instanceof DailyActivityError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+apiRouter.get('/checkin/status', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const state = store.getState();
+    const partner = state.users.find((user) => user.id !== userId) || state.users[1];
+    const [mine, theirs] = await Promise.all([
+      getDailyCheckinStats(getRuntimePool(), userId),
+      getDailyCheckinStats(getRuntimePool(), partner.id),
+    ]);
+    return res.json({
+      myCheckin: mine.todayCheckin,
+      partnerCheckin: theirs.todayCheckin,
+      myStreak: mine.currentStreak,
+      partnerStreak: theirs.currentStreak,
+      hasCheckedInToday: mine.hasCheckedInToday,
+      partnerHasCheckedInToday: theirs.hasCheckedInToday,
+      daysUntilBonus: mine.currentStreak > 0 && mine.currentStreak % 7 === 0 ? 0 : 7 - (mine.currentStreak % 7),
+      totalCoins: mine.totalCoins,
+      partnerName: partner.name,
+    });
+  } catch (error) {
+    const statusCode = error instanceof DailyActivityError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+apiRouter.get('/leaves', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const state = store.getState();
+    const partner = state.users.find((user) => user.id !== userId) || state.users[1];
+    return res.json(await listLeaves(getRuntimePool(), userId, partner.id));
+  } catch (error) {
+    const statusCode = error instanceof DailyActivityError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+apiRouter.post('/leaves/apply', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const leave = await applyLeave(getRuntimePool(), userId, req.body.date || calculateDayInfo().currentDate, req.body.reason || 'Personal Rest / Holiday');
+    return res.json({ success: true, message: 'Approved holiday applied.', leave, remainingLeaves: leave.remainingLeaves, leavesUsed: leave.leavesUsed });
+  } catch (error) {
+    const statusCode = error instanceof DailyActivityError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Legacy implementations remain unreachable under these internal paths while
+// their response contracts are retired from the live API.
+apiRouter.post('/legacy/checkin', (req, res) => {
+  try {
+    const user = requireAuthUser(req, res);
+    if (!user) return;
+
+    const state = store.getState();
+    const dayInfo = calculateDayInfo();
+    const currentDate = dayInfo.currentDate;
+
+    state.dailyCheckins = state.dailyCheckins || [];
+    state.pointLedger = state.pointLedger || [];
+    state.notifications = state.notifications || [];
+    state.auditLogs = state.auditLogs || [];
+
+    // 1. Check if user already checked in today
+    const existing = state.dailyCheckins.find(c => c.userId === user.id && c.date === currentDate);
+    if (existing) {
+      const myCheckinStats = calculateCheckinStats(user.id);
+      const partnerUser = state.users.find(u => u.id !== user.id) || state.users[1];
+      const partnerCheckinStats = calculateCheckinStats(partnerUser.id);
+      const daysUntilBonus = myCheckinStats.currentStreak > 0 && myCheckinStats.currentStreak % 7 === 0 ? 0 : 7 - (myCheckinStats.currentStreak % 7);
+
+      return res.json({
+        success: false,
+        alreadyCheckedIn: true,
+        message: `You have already checked in today at ${existing.timeStr || existing.checkedInAt}! Streak is active.`,
+        streak: existing.streakDay,
+        coinsAwarded: 0,
+        checkin: existing,
+        dailyCheckinInfo: {
+          myCheckin: existing,
+          partnerCheckin: partnerCheckinStats.todayCheckin,
+          myStreak: myCheckinStats.currentStreak,
+          partnerStreak: partnerCheckinStats.currentStreak,
+          hasCheckedInToday: true,
+          partnerHasCheckedInToday: partnerCheckinStats.hasCheckedInToday,
+          daysUntilBonus,
+          totalCoins: myCheckinStats.totalCoins,
+          partnerName: partnerUser.name,
+        },
+      });
+    }
+
+    // 2. Calculate new streak
+    const yesterday = new Date(currentDate);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = yesterday.toISOString().split('T')[0];
+    const yesterdayCheckin = state.dailyCheckins.find(c => c.userId === user.id && c.date === yesterdayStr);
+
+    const newStreak = yesterdayCheckin ? (yesterdayCheckin.streakDay || 1) + 1 : 1;
+
+    // 3. 7-Day Continuous Streak bonus (+5 extra points)
+    const is7DayBonus = newStreak > 0 && newStreak % 7 === 0;
+    const bonusPoints = is7DayBonus ? 5 : 0;
+    const totalCoinsForThisCheckin = 1 + bonusPoints;
+
+    const nowIso = getISTNow().toISOString();
+    const checkinRecord = {
+      id: `checkin-${user.id}-${currentDate}-${Date.now()}`,
+      userId: user.id,
+      date: currentDate,
+      checkedInAt: nowIso,
+      timeStr: dayInfo.istTime,
+      streakDay: newStreak,
+      coinsAwarded: totalCoinsForThisCheckin,
+      bonusAwarded: is7DayBonus,
+      bonusPoints,
+    };
+
+    state.dailyCheckins.push(checkinRecord);
+
+    // 4. Ledger entries
+    const userEntries = state.pointLedger.filter(e => e.userId === user.id);
+    let curPts = userEntries.reduce((s, e) => s + e.points, 0);
+
+    // Base check-in: +1 Coin / Point
+    state.pointLedger.push({
+      id: `ledger-checkin-${user.id}-${Date.now()}`,
+      userId: user.id,
+      date: currentDate,
+      timestamp: nowIso,
+      eventType: 'DAILY_CHECKIN',
+      points: 1,
+      runningTotal: curPts + 1,
+      reason: `Daily Check-In verified (+1 Coin, Streak: Day ${newStreak})`,
+      category: 'DISCIPLINE',
+    });
+    curPts += 1;
+
+    // 7-day continuous streak bonus: +5 extra points
+    if (is7DayBonus) {
+      state.pointLedger.push({
+        id: `ledger-checkin-bonus-${user.id}-${Date.now()}`,
+        userId: user.id,
+        date: currentDate,
+        timestamp: nowIso,
+        eventType: 'CHECKIN_STREAK_7_BONUS',
+        points: 5,
+        runningTotal: curPts + 5,
+        reason: `🎉 7-Day Continuous Streak Milestone Achieved! (+5 Extra Points Awarded)`,
+        category: 'DISCIPLINE',
+      });
+      curPts += 5;
+    }
+
+    // 5. Audit log
+    state.auditLogs.unshift({
+      id: `audit-checkin-${Date.now()}`,
+      actorId: user.id,
+      actorName: user.name,
+      action: 'DAILY_CHECKIN',
+      targetType: 'STREAK_RECORD',
+      targetId: currentDate,
+      reason: is7DayBonus
+        ? `Checked in for ${currentDate}. Earned +1 Coin and maintained 7-Day streak (+5 Bonus Points)! Streak: ${newStreak} days.`
+        : `Checked in for ${currentDate}. Earned +1 Coin and incremented streak to ${newStreak} days.`,
+      timestamp: nowIso,
+    });
+
+    // 6. Notifications for user and partner
+    state.notifications.unshift({
+      id: `notif-checkin-u-${Date.now()}`,
+      userId: user.id,
+      type: 'STREAK_MILESTONE',
+      title: is7DayBonus
+        ? `🎉 7-Day Streak Bonus! (+6 Points / Coins)`
+        : `⚡ Checked In! (+1 Coin, Streak: Day ${newStreak})`,
+      message: is7DayBonus
+        ? `Incredible dedication! You maintained 7 continuous days of check-ins. +1 Coin + 5 bonus points awarded!`
+        : `Daily check-in recorded at ${dayInfo.istTime} IST. Current streak: ${newStreak} consecutive days.`,
+      read: false,
+      createdAt: nowIso,
+    });
+
+    const partnerUser = state.users.find(u => u.id !== user.id) || state.users[1];
+    if (partnerUser) {
+      state.notifications.unshift({
+        id: `notif-checkin-p-${Date.now()}`,
+        userId: partnerUser.id,
+        type: 'COMPETITION_ALERT',
+        title: `⚡ ${user.name} Checked In (Streak: Day ${newStreak})`,
+        message: `${user.name} checked in at ${dayInfo.istTime} IST with +1 Coin. They are now on a ${newStreak}-day streak!`,
+        read: false,
+        createdAt: nowIso,
+      });
+    }
+
+    store.save();
+
+    const myCheckinStats = calculateCheckinStats(user.id);
+    const partnerCheckinStats = calculateCheckinStats(partnerUser.id);
+    const daysUntilBonus = newStreak > 0 && newStreak % 7 === 0 ? 0 : 7 - (newStreak % 7);
+
+    res.json({
+      success: true,
+      message: is7DayBonus
+        ? `🔥 Incredible! 7-Day Streak achieved! +1 Coin & +5 Extra Bonus Points awarded!`
+        : `⚡ Check-In confirmed! +1 Coin and Streak +1 added.`,
+      streak: newStreak,
+      coinsAwarded: 1,
+      bonusAwarded: is7DayBonus,
+      bonusPoints,
+      totalCoinsAwarded: totalCoinsForThisCheckin,
+      checkin: checkinRecord,
+      dailyCheckinInfo: {
+        myCheckin: checkinRecord,
+        partnerCheckin: partnerCheckinStats.todayCheckin,
+        myStreak: newStreak,
+        partnerStreak: partnerCheckinStats.currentStreak,
+        hasCheckedInToday: true,
+        partnerHasCheckedInToday: partnerCheckinStats.hasCheckedInToday,
+        daysUntilBonus,
+        totalCoins: myCheckinStats.totalCoins,
+        partnerName: partnerUser.name,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.get('/legacy/checkin/status', (req, res) => {
+  try {
+    const user = requireAuthUser(req, res);
+    if (!user) return;
+
+    const state = store.getState();
+    const partnerUser = state.users.find(u => u.id !== user.id) || state.users[1];
+
+    const myCheckinStats = calculateCheckinStats(user.id);
+    const partnerCheckinStats = calculateCheckinStats(partnerUser.id);
+    const daysUntilBonus = myCheckinStats.currentStreak > 0 && myCheckinStats.currentStreak % 7 === 0 ? 0 : 7 - (myCheckinStats.currentStreak % 7);
+
+    res.json({
+      myCheckin: myCheckinStats.todayCheckin,
+      partnerCheckin: partnerCheckinStats.todayCheckin,
+      myStreak: myCheckinStats.currentStreak,
+      partnerStreak: partnerCheckinStats.currentStreak,
+      hasCheckedInToday: myCheckinStats.hasCheckedInToday,
+      partnerHasCheckedInToday: partnerCheckinStats.hasCheckedInToday,
+      daysUntilBonus,
+      totalCoins: myCheckinStats.totalCoins,
+      partnerName: partnerUser.name,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------------
+// 2B. LEAVES & HOLIDAY SHIFTING SYSTEM (5 DAYS TOTAL QUOTA)
+// ----------------------------------------------------------------------
+apiRouter.get('/legacy/leaves', (req, res) => {
+  try {
+    const user = requireAuthUser(req, res);
+    if (!user) return;
+
+    const state = store.getState();
+    state.leaves = state.leaves || [];
+
+    const partner = state.users.find(u => u.id !== user.id) || state.users[1];
+    const userLeaves = state.leaves.filter(l => l.userId === user.id);
+    const partnerLeaves = state.leaves.filter(l => l.userId === partner.id);
+
+    res.json({
+      userLeaves,
+      partnerLeaves,
+      leavesUsed: userLeaves.length,
+      remainingLeaves: Math.max(0, 5 - userLeaves.length),
+      partnerRemainingLeaves: Math.max(0, 5 - partnerLeaves.length),
+      maxAllowed: 5,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/legacy/leaves/apply', (req, res) => {
+  try {
+    const user = requireAuthUser(req, res);
+    if (!user) return;
+
+    const state = store.getState();
+    const dayInfo = calculateDayInfo();
+    const { date, reason } = req.body;
+
+    state.leaves = state.leaves || [];
+    const targetDate = date || dayInfo.currentDate;
+
+    const userLeaves = state.leaves.filter(l => l.userId === user.id);
+    if (userLeaves.length >= 5) {
+      return res.status(400).json({
+        error: 'Leave quota exhausted! You have already taken the maximum 5 allowable holidays in this 100-day crucible.',
+      });
+    }
+
+    if (userLeaves.some(l => l.date === targetDate)) {
+      return res.status(400).json({
+        error: `A holiday is already recorded for ${targetDate}.`,
+      });
+    }
+
+    const nowIso = getISTNow().toISOString();
+    const newLeave = {
+      id: `leave-${user.id}-${Date.now()}`,
+      userId: user.id,
+      date: targetDate,
+      appliedAt: nowIso,
+      reason: reason || 'Personal Rest / Holiday',
+    };
+
+    state.leaves.push(newLeave);
+
+    // Add ledger entry (0 points penalty, schedule shift)
+    const userEntries = state.pointLedger.filter(e => e.userId === user.id);
+    const curPts = userEntries.reduce((s, e) => s + e.points, 0);
+    state.pointLedger.push({
+      id: `ledger-leave-${Date.now()}`,
+      userId: user.id,
+      date: targetDate,
+      timestamp: nowIso,
+      eventType: 'LEAVE_HOLIDAY_APPLIED',
+      points: 0,
+      runningTotal: curPts,
+      reason: `Approved Holiday (Day ${userLeaves.length + 1}/5). Task schedule shifted 1 day forward without point penalty.`,
+      category: 'ADMIN',
+    });
+
+    const partner = state.users.find(u => u.id !== user.id);
+    state.notifications.unshift({
+      id: `notif-leave-${Date.now()}`,
+      userId: user.id,
+      type: 'APPROVAL_RESPONSE',
+      title: `🏖️ Holiday Approved (${5 - (userLeaves.length + 1)} Leaves Left)`,
+      message: `Your leave for ${targetDate} is active. Today's task has been shifted 1 day forward with zero point loss.`,
+      read: false,
+      createdAt: nowIso,
+    });
+
+    if (partner) {
+      state.notifications.unshift({
+        id: `notif-leave-p-${Date.now()}`,
+        userId: partner.id,
+        type: 'COMPETITION_ALERT',
+        title: `🏖️ Partner On Approved Holiday`,
+        message: `${user.name} is on approved holiday for ${targetDate} (${5 - (userLeaves.length + 1)} leaves left). Their task schedule shifts forward by 1 day.`,
+        read: false,
+        createdAt: nowIso,
+      });
+    }
+
+    state.auditLogs.unshift({
+      id: `audit-leave-${Date.now()}`,
+      actorId: user.id,
+      actorName: user.name,
+      action: 'APPLY_HOLIDAY',
+      targetType: 'LEAVE_QUOTA',
+      targetId: targetDate,
+      reason: `Holiday applied for ${targetDate}. Remaining leaves: ${5 - (userLeaves.length + 1)}. Schedule shifted forward.`,
+      timestamp: nowIso,
+    });
+
+    store.save();
+
+    res.json({
+      success: true,
+      message: `Approved holiday applied for ${targetDate}. Daily task schedule shifted forward by 1 day with zero penalty.`,
+      leave: newLeave,
+      remainingLeaves: 5 - (userLeaves.length + 1),
+      leavesUsed: userLeaves.length + 1,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------------
+// 3. ROADMAP & CURRICULUM
+// ----------------------------------------------------------------------
+apiRouter.get('/roadmap', (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const state = store.getState();
+  const dayInfo = calculateDayInfo();
+
+  // Annotate tasks with user status
+  const tasksWithStatus = state.tasks.map(task => {
+    const userStatus = state.taskStatuses.find(
+      ts => ts.taskId === task.id && ts.userId === currentUser.id
+    );
+    const dsa = state.dsaProblems.find(d => d.dayNumber === task.dayNumber);
+    const dsaAttempt = dsa
+      ? state.dsaAttempts.find(a => a.problemId === dsa.id && a.userId === currentUser.id)
+      : null;
+    const sectionStatuses = Object.fromEntries(
+      DAILY_SCHEDULE_SECTIONS.map(section => [
+        section,
+        state.scheduleSectionStatuses.find(
+          status => status.taskId === task.id && status.section === section && status.userId === currentUser.id
+        ) || { taskId: task.id, section, userId: currentUser.id, status: 'PENDING', pointsAwarded: 0 },
+      ])
+    );
+
+    return {
+      ...task,
+      dsaProblem: dsa,
+      sectionStatuses,
+      userStatus: userStatus?.status || 'PENDING',
+      dsaSolved: dsaAttempt?.status === 'SOLVED',
+      isCurrentDay: task.dayNumber === dayInfo.dayNumber,
+      isLocked: task.dayNumber > dayInfo.dayNumber,
+    };
+  });
+
+  const subjectPoints = Object.fromEntries(
+    DAILY_SCHEDULE_SECTIONS.map(section => [
+      section,
+      state.pointLedger
+        .filter(
+          entry =>
+            entry.userId === currentUser.id &&
+            (entry.metadata?.section === section || (section === 'DSA' && entry.eventType === 'DSA_COMPLETED'))
+        )
+        .reduce((sum, entry) => sum + entry.points, 0),
+    ])
+  );
+
+  res.json({
+    totalDays: state.tasks.length,
+    currentDayNumber: dayInfo.dayNumber,
+    tasks: tasksWithStatus,
+    subjectPoints,
+  });
+});
+
+apiRouter.get('/roadmap/days/:day', (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const dayNum = parseInt(req.params.day, 10);
+  const state = store.getState();
+  const dayInfo = calculateDayInfo();
+
+  const task = state.tasks.find(t => t.dayNumber === dayNum);
+  if (!task) {
+    return res.status(404).json({ error: 'Day not found' });
+  }
+
+  const dsa = state.dsaProblems.find(d => d.dayNumber === dayNum);
+  const userStatus = state.taskStatuses.find(
+    ts => ts.taskId === task.id && ts.userId === currentUser.id
+  );
+  const partnerUser = state.users.find(u => u.id !== currentUser.id)!;
+  const partnerStatus = state.taskStatuses.find(
+    ts => ts.taskId === task.id && ts.userId === partnerUser.id
+  );
+
+  const dsaAttempt = dsa
+    ? state.dsaAttempts.find(a => a.problemId === dsa.id && a.userId === currentUser.id)
+    : null;
+
+  // Check cooldown for reversal
+  const cooldown = checkPermissionCooldown(currentUser.id, 'TASK_REVERSAL', task.id);
+
+  res.json({
+    task,
+    dsa,
+    dsaProblem: dsa,
+    userStatus: userStatus?.status || 'PENDING',
+    completedAt: userStatus?.completedAt,
+    partnerStatus: partnerStatus?.status || 'PENDING',
+    dsaAttempt,
+    isCurrentDay: dayNum === dayInfo.dayNumber,
+    isPastDay: dayNum < dayInfo.dayNumber,
+    isFutureDay: dayNum > dayInfo.dayNumber,
+    reversalCooldown: cooldown,
+  });
+});
+
+// ----------------------------------------------------------------------
+// 3B. COMPREHENSIVE HISTORICAL DAY ARCHIVE & CALENDAR OVERVIEW
+// ----------------------------------------------------------------------
+apiRouter.get('/history/calendar-overview', (req, res) => {
+  try {
+    const currentUser = requireAuthUser(req, res);
+    if (!currentUser) return;
+
+    const state = store.getState();
+    const partnerUser = state.users.find(u => u.id !== currentUser.id) || state.users[1];
+    const dayInfo = calculateDayInfo();
+
+    state.tasks = state.tasks || [];
+    state.taskStatuses = state.taskStatuses || [];
+    state.journals = state.journals || [];
+    state.pointLedger = state.pointLedger || [];
+    state.dsaAttempts = state.dsaAttempts || [];
+
+    const days = state.tasks.map(task => {
+      const isPast = task.dayNumber < dayInfo.dayNumber;
+      const isCurrent = task.dayNumber === dayInfo.dayNumber;
+      const isFuture = task.dayNumber > dayInfo.dayNumber;
+      const isUnlocked = !isFuture;
+
+      const myStatus = state.taskStatuses.find(
+        ts => ts.taskId === task.id && ts.userId === currentUser.id
+      );
+      const partnerStatus = state.taskStatuses.find(
+        ts => ts.taskId === task.id && ts.userId === partnerUser.id
+      );
+
+      const myJournal = state.journals.find(
+        j => j.userId === currentUser.id && j.date === task.date
+      );
+      const partnerJournal = state.journals.find(
+        j => j.userId === partnerUser.id && j.date === task.date
+      );
+
+      const myPoints = state.pointLedger
+        .filter(e => e.userId === currentUser.id && e.date === task.date)
+        .reduce((sum, e) => sum + e.points, 0);
+
+      const partnerPoints = state.pointLedger
+        .filter(e => e.userId === partnerUser.id && e.date === task.date)
+        .reduce((sum, e) => sum + e.points, 0);
+
+      return {
+        dayNumber: task.dayNumber,
+        date: task.date,
+        title: task.title,
+        category: task.category,
+        priority: task.priority,
+        isUnlocked,
+        isPast,
+        isCurrent,
+        isFuture,
+        myStatus: myStatus?.status || (isPast ? 'MISSED' : 'PENDING'),
+        partnerStatus: partnerStatus?.status || (isPast ? 'MISSED' : 'PENDING'),
+        hasMyJournal: !!myJournal,
+        hasPartnerJournal: !!partnerJournal,
+        myPoints,
+        partnerPoints,
+      };
+    });
+
+    res.json({
+      currentDayNumber: dayInfo.dayNumber,
+      currentDate: dayInfo.currentDate,
+      totalDays: 100,
+      challengeStartDate: dayInfo.challengeStartDate,
+      days,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.get('/day/:day', (req, res) => {
+  try {
+    const currentUser = requireAuthUser(req, res);
+    if (!currentUser) return;
+
+    const dayNum = parseInt(req.params.day, 10);
+    const state = store.getState();
+    const partnerUser = state.users.find(u => u.id !== currentUser.id) || state.users[1];
+    const dayInfo = calculateDayInfo();
+
+    const task = state.tasks.find(t => t.dayNumber === dayNum);
+    if (!task) {
+      return res.status(404).json({ error: 'Day not found' });
+    }
+
+    const dsaProblem = state.dsaProblems.find(d => d.dayNumber === dayNum);
+    const isPast = dayNum < dayInfo.dayNumber;
+    const isCurrent = dayNum === dayInfo.dayNumber;
+    const isFuture = dayNum > dayInfo.dayNumber;
+
+    // Task statuses
+    const userTaskStatus = state.taskStatuses.find(
+      ts => ts.taskId === task.id && ts.userId === currentUser.id
+    );
+    const partnerTaskStatus = state.taskStatuses.find(
+      ts => ts.taskId === task.id && ts.userId === partnerUser.id
+    );
+
+    // DSA attempts
+    const userDsaAttempt = dsaProblem
+      ? state.dsaAttempts.find(a => a.problemId === dsaProblem.id && a.userId === currentUser.id)
+      : undefined;
+    const partnerDsaAttempt = dsaProblem
+      ? state.dsaAttempts.find(a => a.problemId === dsaProblem.id && a.userId === partnerUser.id)
+      : undefined;
+
+    // Journals for this date
+    state.journals = state.journals || [];
+    const userJournal = state.journals.find(
+      j => j.userId === currentUser.id && j.date === task.date
+    ) || null;
+    const partnerJournal = state.journals.find(
+      j => j.userId === partnerUser.id && j.date === task.date
+    ) || null;
+
+    // Daily checkins
+    state.dailyCheckins = state.dailyCheckins || [];
+    const userCheckin = state.dailyCheckins.find(
+      c => c.userId === currentUser.id && c.date === task.date
+    ) || null;
+    const partnerCheckin = state.dailyCheckins.find(
+      c => c.userId === partnerUser.id && c.date === task.date
+    ) || null;
+
+    // Ledger entries on this day
+    const userDayLedger = state.pointLedger.filter(
+      e => e.userId === currentUser.id && e.date === task.date
+    );
+    const partnerDayLedger = state.pointLedger.filter(
+      e => e.userId === partnerUser.id && e.date === task.date
+    );
+
+    const userDayPoints = userDayLedger.reduce((sum, e) => sum + e.points, 0);
+    const partnerDayPoints = partnerDayLedger.reduce((sum, e) => sum + e.points, 0);
+
+    // Pending permission request for this day's task
+    const existingRequest = state.permissions.find(
+      p =>
+        p.entityId === task.id &&
+        p.requesterId === currentUser.id &&
+        p.status === 'PENDING'
+    ) || null;
+
+    // Can request approval if day is in past and task was missed or left pending
+    const canRequestApproval =
+      isPast &&
+      (!userTaskStatus ||
+        userTaskStatus.status === 'MISSED' ||
+        userTaskStatus.status === 'PENDING');
+
+    res.json({
+      dayNumber: dayNum,
+      date: task.date,
+      isPast,
+      isCurrent,
+      isFuture,
+      isLocked: isFuture,
+      currentDayNumber: dayInfo.dayNumber,
+      task,
+      dsaProblem,
+      currentUser: {
+        id: currentUser.id,
+        name: currentUser.name,
+        avatar: currentUser.avatar,
+        taskStatus: userTaskStatus?.status || (isPast ? 'MISSED' : 'PENDING'),
+        completedAt: userTaskStatus?.completedAt,
+        pointsAwarded: userTaskStatus?.pointsAwarded || 0,
+        dsaAttempt: userDsaAttempt || null,
+        journal: userJournal,
+        checkin: userCheckin,
+        dayPoints: userDayPoints,
+        dayLedger: userDayLedger,
+      },
+      partnerUser: {
+        id: partnerUser.id,
+        name: partnerUser.name,
+        avatar: partnerUser.avatar,
+        taskStatus: partnerTaskStatus?.status || (isPast ? 'MISSED' : 'PENDING'),
+        completedAt: partnerTaskStatus?.completedAt,
+        pointsAwarded: partnerTaskStatus?.pointsAwarded || 0,
+        dsaAttempt: partnerDsaAttempt || null,
+        journal: partnerJournal,
+        checkin: partnerCheckin,
+        dayPoints: partnerDayPoints,
+        dayLedger: partnerDayLedger,
+      },
+      existingRequest,
+      canRequestApproval,
+      // Backward compatibility fields
+      rahulStatus: (currentUser.id === 'user-rahul' ? userTaskStatus : partnerTaskStatus)?.status || (isPast ? 'MISSED' : 'PENDING'),
+      dileepStatus: (currentUser.id === 'user-dileep' ? userTaskStatus : partnerTaskStatus)?.status || (isPast ? 'MISSED' : 'PENDING'),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Request partner approval for a past day's task that was left incomplete
+apiRouter.post('/day/:day/request-approval', (req, res) => {
+  try {
+    const dayNum = parseInt(req.params.day, 10);
+    const { reason } = req.body;
+    const currentUser = getAuthUser(req);
+    const state = store.getState();
+    const dayInfo = calculateDayInfo();
+
+    if (!reason || reason.trim().length < 5) {
+      return res.status(400).json({ error: 'Please explain why you are requesting approval for this past task (min 5 characters).' });
+    }
+
+    const task = state.tasks.find(t => t.dayNumber === dayNum);
+    if (!task) return res.status(404).json({ error: 'Day task not found' });
+
+    if (dayNum >= dayInfo.dayNumber) {
+      return res.status(400).json({ error: 'This task is active or upcoming today. Only past days require retroactive approval.' });
+    }
+
+    const userStatus = state.taskStatuses.find(
+      ts => ts.taskId === task.id && ts.userId === currentUser.id
+    );
+    if (userStatus && (userStatus.status === 'COMPLETED_ON_TIME' || userStatus.status === 'COMPLETED_LATE')) {
+      return res.status(400).json({ error: 'This task was already marked complete.' });
+    }
+
+    // Create permission request
+    const request = createPermissionRequest(
+      currentUser.id,
+      'RETROACTIVE_COMPLETION',
+      task.id,
+      `Day ${dayNum}: ${task.title}`,
+      reason.trim()
+    );
+
+    res.json({
+      success: true,
+      message: `Approval request sent to your partner for Day ${dayNum}. Once approved, late completion (+2 pts) will be credited.`,
+      request,
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/future-schedule-request', (req, res) => {
+  try {
+    const { entityId, entityType = 'TASK', proposedDay, reason } = req.body || {};
+    const currentUser = requireAuthUser(req, res);
+    if (!currentUser) {
+      return;
+    }
+
+    if (!entityId || !proposedDay || !reason || String(reason).trim().length < 5) {
+      return res.status(400).json({ error: 'A valid proposed day and clear reason are required.' });
+    }
+
+    const state = store.getState();
+    const dayInfo = calculateDayInfo();
+    const futureEntity = entityType === 'DSA'
+      ? state.dsaProblems.find(item => item.id === entityId)
+      : state.tasks.find(item => item.id === entityId);
+
+    if (!futureEntity) {
+      return res.status(404).json({ error: 'Future task or DSA item not found.' });
+    }
+
+    const proposedDayNumber = Number(proposedDay);
+    if (!Number.isFinite(proposedDayNumber) || proposedDayNumber < 1 || proposedDayNumber > 100) {
+      return res.status(400).json({ error: 'Requested day must be between 1 and 100.' });
+    }
+
+    if (futureEntity.dayNumber <= dayInfo.dayNumber) {
+      return res.status(400).json({ error: 'Only future-unstarted items may be rescheduled through the mutual approval workflow.' });
+    }
+
+    const existingPending = state.permissions.find(
+      p =>
+        p.requesterId === currentUser.id &&
+        p.entityId === entityId &&
+        p.actionType === 'SCHEDULE_CHANGE' &&
+        p.status === 'PENDING'
+    );
+    if (existingPending) {
+      return res.status(409).json({ error: 'A change request for this future item is already awaiting approval.' });
+    }
+
+    const cooldown = checkPermissionCooldown(currentUser.id, 'SCHEDULE_CHANGE', entityId);
+    if (cooldown.isBlocked) {
+      return res.status(429).json({ error: `This request is blocked by the 12-hour cooldown. ${cooldown.remainingText}` });
+    }
+
+    const request = createPermissionRequest(
+      currentUser.id,
+      'SCHEDULE_CHANGE',
+      entityId,
+      futureEntity.title || `Day ${futureEntity.dayNumber}`,
+      String(reason).trim(),
+      {
+        entityType: entityType === 'DSA' ? 'DSA' : 'TASK',
+        oldValue: `Day ${futureEntity.dayNumber}`,
+        proposedValue: `Day ${proposedDayNumber}`,
+      }
+    );
+
+    res.json({
+      success: true,
+      message: 'Future schedule change request submitted. It remains pending mutual approval until the partner reviews it.',
+      request,
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------------
+// 4. DAILY TASKS & COMPLETIONS
+// ----------------------------------------------------------------------
+apiRouter.get('/tasks/today', (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const state = store.getState();
+  const dayInfo = calculateDayInfo();
+
+  const task = state.tasks.find(t => t.dayNumber === dayInfo.dayNumber);
+  if (!task) return res.status(404).json({ error: 'Today task not found' });
+
+  const status = state.taskStatuses.find(
+    ts => ts.taskId === task.id && ts.userId === currentUser.id
+  );
+  const cooldown = checkPermissionCooldown(currentUser.id, 'TASK_REVERSAL', task.id);
+
+  res.json({
+    task,
+    status: status?.status || 'PENDING',
+    completedAt: status?.completedAt,
+    pointsAwarded: status?.pointsAwarded || 0,
+    windowStatus: dayInfo.windowStatus,
+    cooldown,
+  });
+});
+
+// Mark Task Complete (Section 19, 20)
+apiRouter.post('/tasks/:id/complete', async (req, res) => {
+  const { confirmed } = req.body;
+  if (!confirmed) {
+    return res.status(400).json({
+      error: 'Confirmation required: Must explicitly confirm task completion.',
+    });
+  }
+
+  const taskId = req.params.id;
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+
+  try {
+    const result = await completeTask(getRuntimePool(), userId, taskId);
+    return res.json({ success: true, message: 'Completion permanently recorded.', ...result });
+  } catch (error) {
+    const statusCode = error instanceof TaskCompletionError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Reversal Request (Section 21)
+const handleReversalRequest = (req: any, res: any) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const { reason } = req.body;
+  if (!reason || reason.trim().length < 5) {
+    return res.status(400).json({ error: 'Please provide a clear reason for requesting reversal.' });
+  }
+
+  const taskId = req.params.id;
+  const state = store.getState();
+
+  const task = state.tasks.find(t => t.id === taskId);
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+
+  const status = state.taskStatuses.find((entry) => entry.taskId === taskId && entry.userId === currentUser.id);
+  if (!status || (status.status !== 'COMPLETED_ON_TIME' && status.status !== 'COMPLETED_LATE')) {
+    return res.status(400).json({ error: 'Only completed tasks can be submitted for reversal.' });
+  }
+
+  try {
+    const request = createPermissionRequest(
+      currentUser.id,
+      'TASK_REVERSAL',
+      taskId,
+      task.title,
+      reason
+    );
+    res.json({
+      success: true,
+      message: 'Reversal request submitted to your partner for mutual approval.',
+      request,
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+};
+
+apiRouter.post('/tasks/:id/reversal-request', handleReversalRequest);
+apiRouter.post('/tasks/:id/reversal', handleReversalRequest);
+
+// ----------------------------------------------------------------------
+// 5. DSA PROBLEM SOLVING
+// ----------------------------------------------------------------------
+apiRouter.get('/dsa/today', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const state = store.getState();
+    const problem = state.dsaProblems.find((item) => item.dayNumber === calculateDayInfo().dayNumber);
+    if (!problem) return res.status(404).json({ error: 'No DSA problem found for today' });
+    const attempt = await getDsaAttempt(getRuntimePool(), userId, problem.id);
+    return res.json({ problem, attempt, isSolved: attempt?.status === 'SOLVED' });
+  } catch (error) {
+    const statusCode = error instanceof DsaServiceError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+apiRouter.post('/dsa/:id/attempt', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const problemId = req.params.id || req.body.problemId;
+    const result = await recordDsaAttempt(getRuntimePool(), userId, problemId, req.body.status || 'SOLVED', req.body.timeTakenMinutes, req.body.notes, req.body.codeSnippet);
+    return res.json({ success: true, attempt: result.attempt, pointsAwarded: result.pointsAwarded, message: result.pointsAwarded ? `DSA problem solved! (+${result.pointsAwarded} pts)` : 'Attempt recorded.' });
+  } catch (error) {
+    const statusCode = error instanceof DsaServiceError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+apiRouter.post('/dsa/attempt', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const result = await recordDsaAttempt(getRuntimePool(), userId, req.body.problemId, req.body.status || 'SOLVED', req.body.timeTakenMinutes, req.body.notes, req.body.codeSnippet);
+    return res.json({ success: true, attempt: result.attempt, pointsAwarded: result.pointsAwarded, message: result.pointsAwarded ? `DSA problem solved! (+${result.pointsAwarded} pts)` : 'Attempt recorded.' });
+  } catch (error) {
+    const statusCode = error instanceof DsaServiceError ? error.statusCode : 500;
+    return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+apiRouter.get('/legacy/dsa/today', (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const state = store.getState();
+  const dayInfo = calculateDayInfo();
+
+  const problem = state.dsaProblems.find(p => p.dayNumber === dayInfo.dayNumber);
+  if (!problem) return res.status(404).json({ error: 'No DSA problem found for today' });
+
+  const attempt = state.dsaAttempts.find(
+    a => a.problemId === problem.id && a.userId === currentUser.id
+  );
+
+  res.json({
+    problem,
+    attempt: attempt || null,
+    isSolved: attempt?.status === 'SOLVED',
+  });
+});
+
+const handleDsaAttempt = (req: any, res: any) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const problemId = req.params.id || req.body.problemId;
+  const { status, timeTakenMinutes, notes, codeSnippet } = req.body;
+  const state = store.getState();
+  const dayInfo = calculateDayInfo();
+
+  const problem = state.dsaProblems.find(p => p.id === problemId);
+  if (!problem) return res.status(404).json({ error: 'DSA problem not found' });
+
+  let attempt = state.dsaAttempts.find(
+    a => a.problemId === problemId && a.userId === currentUser.id
+  );
+
+  const wasAlreadySolved = attempt?.status === 'SOLVED';
+  const nowIso = getISTNow().toISOString();
+
+  if (status === 'SOLVED' && !wasAlreadySolved) {
+    // Award points based on problem difficulty
+    const userEntries = state.pointLedger.filter((entry) => entry.userId === currentUser.id);
+    const currentRunning = userEntries.reduce((acc, entry) => acc + entry.points, 0);
+
+    state.pointLedger.push({
+      id: `ledger-dsa-${Date.now()}`,
+      userId: currentUser.id,
+      date: dayInfo.currentDate,
+      timestamp: nowIso,
+      eventType: 'DSA_COMPLETED',
+      points: problem.points,
+      runningTotal: currentRunning + problem.points,
+      sourceTaskId: problem.id,
+      sourceTaskTitle: problem.title,
+      category: 'DSA',
+      reason: `Solved DSA Problem: ${problem.title} (${problem.difficulty} - +${problem.points} pts)`,
+    });
+  }
+
+  if (attempt) {
+    attempt.status = status;
+    attempt.timeTakenMinutes = timeTakenMinutes || attempt.timeTakenMinutes;
+    attempt.notes = notes !== undefined ? notes : attempt.notes;
+    attempt.codeSnippet = codeSnippet !== undefined ? codeSnippet : attempt.codeSnippet;
+    attempt.solvedAt = nowIso;
+  } else {
+    attempt = {
+      id: `attempt-${Date.now()}`,
+      problemId,
+      userId: currentUser.id,
+      date: dayInfo.currentDate,
+      status: status || 'SOLVED',
+      timeTakenMinutes: timeTakenMinutes || 30,
+      notes: notes || '',
+      codeSnippet: codeSnippet || '',
+      solvedAt: nowIso,
+    };
+    state.dsaAttempts.push(attempt);
+  }
+
+  store.save();
+
+  res.json({
+    success: true,
+    attempt,
+    pointsAwarded: status === 'SOLVED' && !wasAlreadySolved ? problem.points : 0,
+    message: status === 'SOLVED' ? `DSA problem solved! (+${problem.points} pts)` : 'Attempt recorded.',
+  });
+};
+
+apiRouter.post('/legacy/dsa/:id/attempt', handleDsaAttempt);
+apiRouter.post('/legacy/dsa/attempt', handleDsaAttempt);
+
+// ----------------------------------------------------------------------
+// 6. SCORE LEDGER (Section 26)
+// ----------------------------------------------------------------------
+const handleGetLedger = (req: any, res: any) => {
+  const state = store.getState();
+  const { userId, eventType } = req.query;
+
+  let entries = [...state.pointLedger];
+
+  if (userId) {
+    entries = entries.filter(e => e.userId === userId);
+  }
+
+  if (eventType) {
+    entries = entries.filter(e => e.eventType === eventType);
+  }
+
+  // Sort descending by timestamp
+  entries.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+  res.json({
+    totalEntries: entries.length,
+    entries,
+  });
+};
+
+apiRouter.get('/points/history', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { const entries = await listLedger(getRuntimePool(), userId, typeof req.query.eventType === 'string' ? req.query.eventType : undefined); return res.json({ totalEntries: entries.length, entries }); }
+  catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+apiRouter.get('/ledger', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { const entries = await listLedger(getRuntimePool(), userId, typeof req.query.eventType === 'string' ? req.query.eventType : undefined); return res.json({ totalEntries: entries.length, entries }); }
+  catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+// ----------------------------------------------------------------------
+// 7. HABIT & SELF-CONTROL TRACKER (Sections 28 & 29)
+// ----------------------------------------------------------------------
+const handleGetHabits = (req: any, res: any) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const state = store.getState();
+
+  const userStats = calculateHabitStats(currentUser.id);
+  const partnerUser = state.users.find(u => u.id !== currentUser.id)!;
+  const partnerStats = calculateHabitStats(partnerUser.id);
+
+  // Private history for current user only
+  const myHistory = state.habits
+    .filter(h => h.userId === currentUser.id)
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  // Today's entry
+  const dayInfo = calculateDayInfo();
+  const todayEntry = state.habits.find(
+    h => h.userId === currentUser.id && h.date === dayInfo.currentDate
+  );
+
+  let habitLeaderName = 'Tied';
+  const diffDays = Math.abs(userStats.currentStreak - partnerStats.currentStreak);
+  let comparisonText = 'Streaks are currently tied.';
+
+  if (userStats.currentStreak > partnerStats.currentStreak) {
+    habitLeaderName = currentUser.name;
+    comparisonText = `${currentUser.name} is ahead by ${diffDays} day${diffDays === 1 ? '' : 's'}`;
+  } else if (partnerStats.currentStreak > userStats.currentStreak) {
+    habitLeaderName = partnerUser.name;
+    comparisonText = `${partnerUser.name} is ahead by ${diffDays} day${diffDays === 1 ? '' : 's'}`;
+  }
+
+  res.json({
+    myStats: userStats,
+    partnerStreak: partnerStats.currentStreak,
+    partnerCleanDays: partnerStats.totalCleanDays,
+    partnerName: partnerUser.name,
+    habitLeaderName,
+    diffDays,
+    comparisonText,
+    todayRecorded: !!todayEntry,
+    todayStatus: todayEntry?.status || null,
+    history: myHistory,
+  });
+};
+
+apiRouter.get('/habits', async (req, res, next) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1];
+    const result = await getHabitData(getRuntimePool(), userId, partner.id);
+    return res.json({ myStats: result.myStats, partnerStreak: result.partnerStats.currentStreak, partnerCleanDays: result.partnerStats.totalCleanDays, partnerName: partner.name, habitLeaderName: result.myStats.currentStreak >= result.partnerStats.currentStreak ? 'Tied' : partner.name, diffDays: Math.abs(result.myStats.currentStreak - result.partnerStats.currentStreak), comparisonText: 'Self-control streak comparison.', todayRecorded: Boolean(result.today), todayStatus: result.today?.status || null, history: result.history });
+  } catch (error) { return next(error); }
+});
+apiRouter.get('/habit', (_req, res) => res.redirect(307, '/api/habits'));
+
+const handleHabitCheckin = (req: any, res: any) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const { status, confirmed, notes } = req.body;
+  if (!confirmed) {
+    return res.status(400).json({ error: 'Confirmation required before recording today\'s self-control status.' });
+  }
+  if (status !== 'REPORTED_RELAPSE') {
+    return res.status(400).json({ error: 'Only a confirmed REPORTED_RELAPSE is accepted for the current day.' });
+  }
+
+  const state = store.getState();
+  const dayInfo = calculateDayInfo();
+  const nowIso = getISTNow().toISOString();
+
+  let todayEntry = state.habits.find(
+    h => h.userId === currentUser.id && h.date === dayInfo.currentDate
+  );
+
+  if (todayEntry) {
+    if (todayEntry.status === 'REPORTED_RELAPSE') {
+      return res.status(409).json({ error: 'Today\'s self-control status has already been recorded.' });
+    }
+    todayEntry.status = 'REPORTED_RELAPSE';
+    todayEntry.notes = notes || todayEntry.notes;
+    todayEntry.recordedAt = nowIso;
+  } else {
+    todayEntry = {
+      id: `habit-${Date.now()}`,
+      userId: currentUser.id,
+      date: dayInfo.currentDate,
+      status: 'REPORTED_RELAPSE',
+      notes: notes || '',
+      recordedAt: nowIso,
+    };
+    state.habits.push(todayEntry);
+  }
+
+  const updatedStats = calculateHabitStats(currentUser.id);
+  store.save();
+
+  res.json({
+    success: true,
+    message: 'Today\'s status has been recorded. Your streak will reset when today\'s challenge day is finalized at midnight.',
+    stats: updatedStats,
+  });
+};
+
+apiRouter.post('/habits/check-in', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  if (!req.body.confirmed || req.body.status !== 'REPORTED_RELAPSE') return res.status(400).json({ error: 'Confirmation required before recording today\'s self-control status.' });
+  try { const result = await recordRelapse(getRuntimePool(), userId, req.body.notes || ''); return res.json({ success: true, message: 'Today\'s status has been recorded.', stats: result.myStats }); }
+  catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+apiRouter.post('/habit/checkin', (_req, res) => res.redirect(307, '/api/habits/check-in'));
+apiRouter.post('/habits/checkin', (_req, res) => res.redirect(307, '/api/habits/check-in'));
+
+// ----------------------------------------------------------------------
+// 8. DAILY JOURNAL & ROUTINE (Section 27)
+// ----------------------------------------------------------------------
+const getJournalLockState = (journalDate: string) => {
+  const now = getISTNow();
+  const editingDeadline = new Date(`${journalDate}T23:59:59.999+05:30`);
+  const isLocked = now.getTime() >= editingDeadline.getTime();
+
+  return {
+    currentServerTime: now.toISOString(),
+    journalDate,
+    journalStatus: isLocked ? 'LOCKED' : 'OPEN',
+    editingDeadline: editingDeadline.toISOString(),
+    isLocked,
+  };
+};
+
+const handleGetJournal = (req: any, res: any) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const state = store.getState();
+  const dayInfo = calculateDayInfo();
+  const targetDate = (req.query.date as string) || dayInfo.currentDate;
+  const lockState = getJournalLockState(targetDate);
+
+  const journal = state.journals.find(
+    j => j.userId === currentUser.id && j.date === targetDate
+  ) || {
+    id: '',
+    userId: currentUser.id,
+    date: targetDate,
+    todayRoutine: '',
+    summary: '',
+    whatILearned: '',
+    whatIBuilt: '',
+    whatIStruggledWith: '',
+    mistakes: '',
+    mistakesLessons: '',
+    tomorrowImprovements: '',
+    tomorrowFocus: '',
+    additionalNotes: '',
+    studyHours: 3.0,
+    focusedExecutionMinutes: undefined,
+    focusedExecutionFinalizedAt: undefined,
+    energyRating: 4,
+    productivityRating: 4,
+    isShared: true,
+    status: 'OPEN',
+    updatedAt: '',
+  };
+
+  const partnerUser = state.users.find(u => u.id !== currentUser.id);
+  const partnerJournal = partnerUser
+    ? state.journals.find(j => j.userId === partnerUser.id && j.date === targetDate)
+    : null;
+
+  res.json({
+    journal,
+    partnerJournal,
+    ...lockState,
+  });
+};
+
+apiRouter.get('/journal/today', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1]; const date = (req.query.date as string) || calculateDayInfo().currentDate; const result = await getJournalData(getRuntimePool(), userId, partner.id, date); return res.json({ ...result, journalStatus: 'OPEN', journalDate: date, currentServerTime: getISTNow().toISOString(), isLocked: false }); }
+  catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+apiRouter.get('/journal', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1]; const date = (req.query.date as string) || calculateDayInfo().currentDate; const result = await getJournalData(getRuntimePool(), userId, partner.id, date); return res.json({ ...result, journalStatus: 'OPEN', journalDate: date, currentServerTime: getISTNow().toISOString(), isLocked: false }); }
+  catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+apiRouter.post('/todays-live/:id/focused-execution/finalize', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  const minutes = Number(req.body?.focusedExecutionMinutes);
+  if (!Number.isFinite(minutes) || minutes < 0) return res.status(400).json({ error: 'Focused execution minutes must be a non-negative number.' });
+  try {
+    const result = await getRuntimePool().query(
+      `UPDATE todays_live tl SET focused_execution_minutes = $3, focused_execution_finalized = true, focused_execution_finalized_at = COALESCE(focused_execution_finalized_at, $4), status = 'SUBMITTED', updated_at = $4
+       FROM participants p WHERE tl.participant_id = p.id AND p.legacy_id = $1 AND tl.id = $2 AND tl.focused_execution_finalized = false
+       RETURNING tl.focused_execution_minutes AS "focusedExecutionMinutes", tl.focused_execution_finalized_at AS "finalizedAt"`,
+      [userId, req.params.id, minutes, getISTNow().toISOString()]
+    );
+    if (!result.rowCount) return res.status(409).json({ error: 'Focused execution has already been finalized or the record was not found.' });
+    return res.json({ success: true, message: 'Focused execution permanently recorded.', ...result.rows[0] });
+  } catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+apiRouter.post('/legacy/todays-live/:id/focused-execution/finalize', (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const journal = store.getState().journals.find(
+    j => j.userId === currentUser.id && j.id === req.params.id,
+  );
+
+  if (!journal) {
+    return res.status(404).json({ error: 'Today\'s Live record not found.' });
+  }
+
+  const { focusedExecutionMinutes } = req.body || {};
+  const finalizeResult = finalizeFocusedExecution(
+    journal,
+    focusedExecutionMinutes,
+    getISTNow().toISOString(),
+  );
+
+  if (!finalizeResult.ok) {
+    return res.status(finalizeResult.code || 400).json({
+      error: finalizeResult.message || 'Focused execution cannot be finalized.',
+    });
+  }
+
+  journal.status = 'SUBMITTED';
+  journal.submittedAt = journal.submittedAt || getISTNow().toISOString();
+  store.save();
+
+  return res.status(200).json({
+    success: true,
+    message: 'Focused execution permanently recorded.',
+    focusedExecutionMinutes: finalizeResult.finalizedMinutes,
+    finalizedAt: finalizeResult.finalizedAt,
+  });
+});
+
+apiRouter.post('/journal', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { const date = req.body.date || calculateDayInfo().currentDate; const journal = await saveJournal(getRuntimePool(), userId, date, req.body); return res.json({ success: true, message: 'Today\'s Live saved securely.', journal, journalDate: date, journalStatus: journal.status, isLocked: false }); }
+  catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+apiRouter.post('/legacy/journal', (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const state = store.getState();
+  const dayInfo = calculateDayInfo();
+  const nowIso = getISTNow().toISOString();
+  const { summary, todayRoutine, whatILearned, whatIBuilt, whatIStruggledWith, mistakes, mistakesLessons, tomorrowImprovements, tomorrowFocus, additionalNotes, studyHours, focusedExecutionMinutes, energyRating, productivityRating, isShared, status, submittedAt } = req.body;
+  const targetDate = req.body.date || dayInfo.currentDate;
+
+  let journal = state.journals.find(
+    j => j.userId === currentUser.id && j.date === targetDate
+  );
+
+  const lockState = getJournalLockState(targetDate);
+  if (journal && (journal.status === 'LOCKED' || lockState.isLocked)) {
+    return res.status(403).json({
+      error: 'Today\'s Live for this date is locked and can no longer be edited.',
+      ...lockState,
+      journalStatus: journal.status || lockState.journalStatus,
+    });
+  }
+
+  if (journal && (journal.focusedExecutionFinalized || journal.focusedExecutionFinalizedAt)) {
+    if (focusedExecutionMinutes !== undefined) {
+      return res.status(409).json({
+        error: 'Focused Execution Hours have already been permanently recorded for this day. They cannot be changed.',
+        ...lockState,
+        journalStatus: journal.status || 'SUBMITTED',
+      });
+    }
+  }
+
+  if (journal) {
+    journal.summary = summary ?? todayRoutine ?? journal.summary ?? journal.todayRoutine ?? '';
+    journal.todayRoutine = todayRoutine ?? journal.todayRoutine ?? journal.summary ?? '';
+    journal.whatILearned = whatILearned ?? journal.whatILearned ?? '';
+    journal.whatIBuilt = whatIBuilt ?? journal.whatIBuilt ?? '';
+    journal.whatIStruggledWith = whatIStruggledWith ?? journal.whatIStruggledWith ?? '';
+    journal.mistakes = mistakes ?? journal.mistakes ?? '';
+    journal.mistakesLessons = mistakesLessons ?? journal.mistakesLessons ?? '';
+    journal.tomorrowImprovements = tomorrowImprovements ?? journal.tomorrowImprovements ?? '';
+    journal.tomorrowFocus = tomorrowFocus ?? journal.tomorrowFocus ?? '';
+    journal.additionalNotes = additionalNotes ?? journal.additionalNotes ?? '';
+    journal.studyHours = Number(studyHours) || journal.studyHours || 3.0;
+    journal.energyRating = Number(energyRating) || journal.energyRating || 4;
+    journal.productivityRating = Number(productivityRating) || journal.productivityRating || 4;
+    journal.isShared = Boolean(isShared);
+
+    if ((status === 'SUBMITTED' || journal.status === 'SUBMITTED') && !journal.submittedAt) {
+      journal.status = 'SUBMITTED';
+      journal.submittedAt = submittedAt || nowIso;
+
+      const finalizeResult = finalizeFocusedExecution(
+        journal,
+        focusedExecutionMinutes ?? journal.focusedExecutionMinutes,
+        nowIso,
+      );
+
+      if (!finalizeResult.ok) {
+        return res.status(finalizeResult.code || 400).json({
+          error: finalizeResult.message || 'Unable to finalize focused execution hours.',
+          ...lockState,
+        });
+      }
+    }
+
+    if ((status === 'LOCKED' || lockState.isLocked) && journal.status !== 'LOCKED') {
+      journal.status = 'LOCKED';
+      journal.lockedAt = nowIso;
+    }
+
+    journal.updatedAt = nowIso;
+  } else {
+    const createdStatus = lockState.isLocked ? 'LOCKED' : (status === 'SUBMITTED' ? 'SUBMITTED' : 'OPEN');
+    const newJournal: any = {
+      id: `journal-${Date.now()}`,
+      userId: currentUser.id,
+      date: targetDate,
+      summary: summary || todayRoutine || '',
+      todayRoutine: todayRoutine || summary || '',
+      whatILearned: whatILearned || '',
+      whatIBuilt: whatIBuilt || '',
+      whatIStruggledWith: whatIStruggledWith || '',
+      mistakes: mistakes || '',
+      mistakesLessons: mistakesLessons || '',
+      tomorrowImprovements: tomorrowImprovements || '',
+      tomorrowFocus: tomorrowFocus || '',
+      additionalNotes: additionalNotes || '',
+      studyHours: Number(studyHours) || 3.0,
+      focusedExecutionMinutes: undefined,
+      focusedExecutionFinalized: false,
+      focusedExecutionFinalizedAt: undefined,
+      energyRating: Number(energyRating) || 4,
+      productivityRating: Number(productivityRating) || 4,
+      isShared: Boolean(isShared),
+      status: createdStatus,
+      submittedAt: status === 'SUBMITTED' ? (submittedAt || nowIso) : undefined,
+      lockedAt: createdStatus === 'LOCKED' ? nowIso : undefined,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    if (status === 'SUBMITTED') {
+      const finalizeResult = finalizeFocusedExecution(newJournal, focusedExecutionMinutes, nowIso);
+      if (!finalizeResult.ok) {
+        return res.status(finalizeResult.code || 400).json({
+          error: finalizeResult.message || 'Unable to finalize focused execution hours.',
+          ...lockState,
+        });
+      }
+    }
+
+    state.journals.push(newJournal);
+    journal = newJournal;
+  }
+
+  state.auditLogs.unshift({
+    id: `audit-journal-${Date.now()}`,
+    actorId: currentUser.id,
+    actorName: currentUser.name,
+    action: journal.status === 'SUBMITTED' ? 'TODAYS_LIVE_SUBMITTED' : 'TODAYS_LIVE_UPDATED',
+    targetType: 'TODAYS_LIVE',
+    targetId: journal.id,
+    reason: `Today's Live updated for ${targetDate} (${journal.status || 'OPEN'})`,
+    timestamp: nowIso,
+  });
+
+  store.save();
+
+  res.json({
+    success: true,
+    message: journal.status === 'SUBMITTED' ? 'Today\'s Live submitted securely.' : 'Today\'s Live saved securely.',
+    journal,
+    ...lockState,
+  });
+});
+
+apiRouter.post('/journal/rate-partner', (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const state = store.getState();
+  const dayInfo = calculateDayInfo();
+  const nowIso = getISTNow().toISOString();
+  const { date, rating } = req.body;
+  const targetDate = date || dayInfo.currentDate;
+  const ratingNum = Math.min(5, Math.max(1, parseInt(rating, 10) || 5));
+
+  const partner = state.users.find(u => u.id !== currentUser.id);
+  if (!partner) return res.status(404).json({ error: 'Partner not found' });
+
+  const partnerJournal = state.journals.find(j => j.userId === partner.id && j.date === targetDate);
+  if (!partnerJournal) {
+    return res.status(404).json({ error: 'Partner Today\'s Live entry was not found for the selected date.' });
+  }
+
+  if (partnerJournal.peerReviewRating && partnerJournal.peerRaterId && partnerJournal.peerRaterId !== currentUser.id) {
+    return res.status(409).json({ error: 'This Today\'s Live entry already has a permanent partner rating.' });
+  }
+
+  if (partnerJournal.peerReviewRating && partnerJournal.peerRaterId === currentUser.id) {
+    return res.status(409).json({ error: 'You have already submitted a rating for this entry.' });
+  }
+
+  if (getJournalLockState(targetDate).isLocked) {
+    return res.status(403).json({ error: 'This Today\'s Live entry is locked and can no longer receive a rating.' });
+  }
+
+  partnerJournal.peerReviewRating = ratingNum;
+  partnerJournal.peerReviewedAt = nowIso;
+  partnerJournal.peerRaterId = currentUser.id;
+  partnerJournal.updatedAt = nowIso;
+
+  state.auditLogs.unshift({
+    id: `audit-rating-${Date.now()}`,
+    actorId: currentUser.id,
+    actorName: currentUser.name,
+    action: 'RATE_PARTNER_JOURNAL',
+    targetType: 'TODAYS_LIVE',
+    targetId: `${partner.id}-${targetDate}`,
+    reason: `${currentUser.name} rated ${partner.name}'s Today's Live: ${ratingNum}/5 stars.`,
+    timestamp: nowIso,
+  });
+
+  state.notifications.unshift({
+    id: `notif-rating-${Date.now()}`,
+    userId: partner.id,
+    type: 'APPROVAL_RESPONSE',
+    title: '⭐ Journal Rating Received',
+    message: `${currentUser.name} rated your Today's Live ${ratingNum}/5 stars.`,
+    read: false,
+    createdAt: nowIso,
+  });
+
+  store.save();
+
+  res.json({
+    success: true,
+    message: `Today's Live rating submitted: ${ratingNum}/5 stars.`,
+    partnerJournal,
+  });
+});
+
+// ----------------------------------------------------------------------
+// 9. PERMISSION & APPROVAL WORKFLOW (Section 21, 22, 23)
+// ----------------------------------------------------------------------
+apiRouter.get('/permissions', (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const state = store.getState();
+
+  // Requests directed to current user to approve/decline
+  const pendingForMe = state.permissions.filter(
+    p => p.targetUserId === currentUser.id && p.status === 'PENDING'
+  );
+
+  // My submitted requests
+  const myRequests = state.permissions.filter(p => p.requesterId === currentUser.id);
+
+  res.json({
+    pendingForMe,
+    myRequests,
+    all: state.permissions,
+  });
+});
+
+apiRouter.post('/permissions/:id/approve', async (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const requestId = req.params.id;
+  const { responseReason } = req.body;
+
+  try {
+    const updated = await handlePermissionResponse(currentUser.id, requestId, 'APPROVE', responseReason);
+    res.json({ success: true, message: 'Approval granted and action executed.', request: updated });
+  } catch (err: any) {
+    const statusCode = err?.statusCode || 400;
+    res.status(statusCode).json({
+      error: err?.message || 'Failed to process approval.',
+      code: statusCode,
+    });
+  }
+});
+
+apiRouter.post('/permissions/:id/decline', async (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const requestId = req.params.id;
+  const { responseReason } = req.body;
+
+  try {
+    const updated = await handlePermissionResponse(currentUser.id, requestId, 'DECLINE', responseReason);
+    res.json({
+      success: true,
+      message: 'Request declined. 12-hour mutual cooldown initiated.',
+      request: updated,
+    });
+  } catch (err: any) {
+    const statusCode = err?.statusCode || 400;
+    res.status(statusCode).json({
+      error: err?.message || 'Failed to process decline.',
+      code: statusCode,
+    });
+  }
+});
+
+// ----------------------------------------------------------------------
+// 10. NOTIFICATIONS & AUDIT LOGS
+// ----------------------------------------------------------------------
+apiRouter.get('/notifications', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { return res.json({ notifications: await listNotifications(getRuntimePool(), userId) }); }
+  catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+apiRouter.post('/notifications/:id/read', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { if (!(await markNotificationRead(getRuntimePool(), userId, req.params.id))) return res.status(404).json({ error: 'Notification not found.' }); return res.json({ success: true }); }
+  catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+apiRouter.post('/notifications/read-all', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { await markAllNotificationsRead(getRuntimePool(), userId); return res.json({ success: true }); }
+  catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+apiRouter.get('/audit-logs', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { return res.json({ logs: await listAuditLogs(getRuntimePool(), userId) }); }
+  catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+// ----------------------------------------------------------------------
+// 11. ANALYTICS (Section 36)
+// ----------------------------------------------------------------------
+apiRouter.get('/analytics', (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const state = store.getState();
+  const dayInfo = calculateDayInfo();
+
+  const toDateString = (dayNumber: number) => {
+    const start = new Date(`${dayInfo.challengeStartDate}T00:00:00+05:30`);
+    const target = new Date(start.getTime() + (dayNumber - 1) * 24 * 60 * 60 * 1000);
+    return getISTDateString(target);
+  };
+
+  const getUserDailyPoints = (userId: string, date: string) =>
+    state.pointLedger.filter(entry => entry.userId === userId && entry.date === date)
+      .reduce((sum, entry) => sum + entry.points, 0);
+
+  const getCompletedTasksForDay = (userId: string, dayNumber: number) => {
+    const task = state.tasks.find(item => item.dayNumber === dayNumber);
+    if (!task) return 0;
+    const status = state.taskStatuses.find(ts => ts.userId === userId && ts.taskId === task.id);
+    if (!status) return 0;
+    return status.status === 'COMPLETED_ON_TIME' || status.status === 'COMPLETED_LATE' ? 1 : 0;
+  };
+
+  const getDsaSolvedForDay = (userId: string, date: string) =>
+    state.dsaAttempts.filter(attempt => attempt.userId === userId && attempt.date === date && attempt.status === 'SOLVED').length;
+
+  const getFocusedHoursForDay = (userId: string, date: string) => {
+    const journal = state.journals.find(entry => entry.userId === userId && entry.date === date);
+    return Number(journal?.studyHours || 0);
+  };
+
+  const getCurrentHabitStreakForDay = (userId: string, dayNumber: number) => {
+    let streak = 0;
+    for (let d = 1; d <= dayNumber; d += 1) {
+      const date = toDateString(d);
+      const entry = state.habits.find(h => h.userId === userId && h.date === date);
+      if (!entry || entry.status === 'HOLIDAY') {
+        if (d < dayNumber) {
+          streak = 0;
+        }
+        continue;
+      }
+      if (entry.status === 'NO_REPORT') {
+        streak += 1;
+      } else if (entry.status === 'REPORTED_RELAPSE') {
+        if (d < dayNumber) {
+          streak = 0;
+        }
+      }
+    }
+    return streak;
+  };
+
+  const timeline: Array<{
+    dayNumber: number;
+    dayLabel: string;
+    date: string;
+    rahulCumulative: number;
+    dileepCumulative: number;
+    rahulDaily: number;
+    dileepDaily: number;
+    rahulTasks: number;
+    dileepTasks: number;
+    rahulDsa: number;
+    dileepDsa: number;
+    rahulFocused: number;
+    dileepFocused: number;
+    rahulStreak: number;
+    dileepStreak: number;
+  }> = [];
+
+  if (!dayInfo.challengeStarted) {
+    return res.json({
+      challenge: {
+        startDate: dayInfo.challengeStartDate,
+        endDate: dayInfo.challengeEndDate,
+        currentDate: dayInfo.currentDate,
+        currentDayNumber: 0,
+        totalDays: dayInfo.totalDays,
+        daysRemaining: dayInfo.daysRemaining,
+      },
+      summary: {
+        rahulScore: 0,
+        dileepScore: 0,
+        leaderId: null,
+        leaderName: null,
+        pointDifference: 0,
+        pointDifferenceText: 'Challenge starts on 15 Sep 2026.',
+        winDays: { rahul: 0, dileep: 0, tie: 0 },
+        bestDailyPerformance: { rahul: 0, dileep: 0, topDay: 0 },
+        averageDailyPoints: { rahul: 0, dileep: 0 },
+        dsaComparison: { rahul: 0, dileep: 0 },
+        focusedExecution: { rahul: 0, dileep: 0 },
+        learningStreak: { rahulCurrent: 0, rahulBest: 0, dileepCurrent: 0, dileepBest: 0 },
+      },
+      timeline: [],
+    });
+  }
+
+  let rahulCumulative = 0;
+  let dileepCumulative = 0;
+
+  for (let dayNumber = 1; dayNumber <= dayInfo.dayNumber; dayNumber += 1) {
+    const date = toDateString(dayNumber);
+    const rahulDaily = getUserDailyPoints('user-rahul', date);
+    const dileepDaily = getUserDailyPoints('user-dileep', date);
+    rahulCumulative += rahulDaily;
+    dileepCumulative += dileepDaily;
+
+    const point = {
+      dayNumber,
+      dayLabel: `Day ${dayNumber}`,
+      date,
+      rahulCumulative,
+      dileepCumulative,
+      rahulDaily,
+      dileepDaily,
+      rahulTasks: getCompletedTasksForDay('user-rahul', dayNumber),
+      dileepTasks: getCompletedTasksForDay('user-dileep', dayNumber),
+      rahulDsa: getDsaSolvedForDay('user-rahul', date),
+      dileepDsa: getDsaSolvedForDay('user-dileep', date),
+      rahulFocused: getFocusedHoursForDay('user-rahul', date),
+      dileepFocused: getFocusedHoursForDay('user-dileep', date),
+      rahulStreak: getCurrentHabitStreakForDay('user-rahul', dayNumber),
+      dileepStreak: getCurrentHabitStreakForDay('user-dileep', dayNumber),
+    };
+
+    timeline.push(point);
+  }
+
+  const rahulScore = timeline.at(-1)?.rahulCumulative || 0;
+  const dileepScore = timeline.at(-1)?.dileepCumulative || 0;
+  const leaderId = rahulScore === dileepScore ? null : rahulScore > dileepScore ? 'user-rahul' : 'user-dileep';
+  const leaderName = leaderId === 'user-rahul' ? 'Rahul' : leaderId === 'user-dileep' ? 'Dileep' : null;
+  const pointDifference = Math.abs(rahulScore - dileepScore);
+  const pointDifferenceText = leaderName
+    ? `${leaderName} leads by ${pointDifference} point${pointDifference === 1 ? '' : 's'}`
+    : "It's a tie.";
+
+  let rahulWins = 0;
+  let dileepWins = 0;
+  let ties = 0;
+
+  timeline.forEach(day => {
+    if (day.rahulDaily > day.dileepDaily) rahulWins += 1;
+    else if (day.dileepDaily > day.rahulDaily) dileepWins += 1;
+    else ties += 1;
+  });
+
+  const bestDailyPerformance = {
+    rahul: Math.max(0, ...timeline.map(day => day.rahulDaily)),
+    dileep: Math.max(0, ...timeline.map(day => day.dileepDaily)),
+    topDay: Math.max(0, ...timeline.map(day => Math.max(day.rahulDaily, day.dileepDaily))),
+  };
+
+  const averageDailyPoints = {
+    rahul: timeline.length ? Number((timeline.reduce((sum, day) => sum + day.rahulDaily, 0) / timeline.length).toFixed(1)) : 0,
+    dileep: timeline.length ? Number((timeline.reduce((sum, day) => sum + day.dileepDaily, 0) / timeline.length).toFixed(1)) : 0,
+  };
+
+  const dsaComparison = {
+    rahul: timeline.reduce((sum, day) => sum + day.rahulDsa, 0),
+    dileep: timeline.reduce((sum, day) => sum + day.dileepDsa, 0),
+  };
+
+  const focusedExecution = {
+    rahul: Number((timeline.reduce((sum, day) => sum + day.rahulFocused, 0)).toFixed(1)),
+    dileep: Number((timeline.reduce((sum, day) => sum + day.dileepFocused, 0)).toFixed(1)),
+  };
+
+  const learningStreak = {
+    rahulCurrent: timeline.at(-1)?.rahulStreak || 0,
+    rahulBest: Math.max(0, ...timeline.map(day => day.rahulStreak)),
+    dileepCurrent: timeline.at(-1)?.dileepStreak || 0,
+    dileepBest: Math.max(0, ...timeline.map(day => day.dileepStreak)),
+  };
+
+  res.json({
+    challenge: {
+      startDate: dayInfo.challengeStartDate,
+      endDate: dayInfo.challengeEndDate,
+      currentDate: dayInfo.currentDate,
+      currentDayNumber: dayInfo.dayNumber,
+      totalDays: dayInfo.totalDays,
+      daysRemaining: dayInfo.daysRemaining,
+    },
+    summary: {
+      rahulScore,
+      dileepScore,
+      leaderId,
+      leaderName,
+      pointDifference,
+      pointDifferenceText,
+      winDays: { rahul: rahulWins, dileep: dileepWins, tie: ties },
+      bestDailyPerformance,
+      averageDailyPoints,
+      dsaComparison,
+      focusedExecution,
+      learningStreak,
+    },
+    timeline,
+  });
+});
+
+// ----------------------------------------------------------------------
+// 12. INTERVIEW QUESTIONS BANK (Section 35)
+// ----------------------------------------------------------------------
+const handleGetInterviewQuestions = (req: any, res: any) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const state = store.getState();
+  const { category, difficulty } = req.query;
+
+  let questions = [...state.interviewQuestions];
+  if (category) {
+    questions = questions.filter(q => q.category === category);
+  }
+  if (difficulty) {
+    questions = questions.filter(q => q.difficulty === difficulty);
+  }
+
+  res.json({ questions, total: questions.length });
+};
+
+apiRouter.get('/interview-questions', handleGetInterviewQuestions);
+apiRouter.get('/interview-bank', handleGetInterviewQuestions);
+
+// ----------------------------------------------------------------------
+// 13. Administrative controls
+// ----------------------------------------------------------------------
+// Settlement and reset are internal/server operations and intentionally have
+// no public HTTP route.
+
+const handleSystemExport = (req: express.Request, res: express.Response) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+
+  const exportData = buildUserExport(store.getState(), currentUser.id);
+  if (!exportData) return res.status(404).json({ error: 'Participant not found.' });
+  res.json(exportData);
+};
+
+apiRouter.get('/system/export', handleSystemExport);
+apiRouter.get('/export', handleSystemExport);
