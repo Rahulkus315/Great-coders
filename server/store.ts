@@ -32,7 +32,10 @@ export function getRuntimePool(env = process.env): Pool {
   }
 
   if (!runtimePool) {
-    const sslRequired = env.PGSSLMODE === 'require' || databaseUrl.includes('pooler.supabase.com');
+    const localDatabaseUrl = new URL(databaseUrl);
+    localDatabaseUrl.searchParams.delete('sslmode');
+    const connectionString = localDatabaseUrl.toString();
+    const sslRequired = env.PGSSLMODE === 'require' || connectionString.includes('pooler.supabase.com');
     const sslConfig = sslRequired ? (() => {
       if (env.SUPABASE_CA_CERT) {
         return { rejectUnauthorized: true, ca: env.SUPABASE_CA_CERT };
@@ -50,7 +53,7 @@ export function getRuntimePool(env = process.env): Pool {
     })() : undefined;
 
     runtimePool = new Pool({
-      connectionString: databaseUrl,
+      connectionString,
       ...(sslConfig ? { ssl: sslConfig } : {}),
     });
   }
