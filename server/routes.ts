@@ -1,5 +1,4 @@
 import express from 'express';
-import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
 import { OAuth2Client } from 'google-auth-library';
 import { getRuntimePool, store } from './store';
@@ -39,6 +38,10 @@ const googleClientId = process.env.GOOGLE_CLIENT_ID || '';
 const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET || '';
 const googleRedirectUri = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/auth/google/callback';
 const googleClient = googleClientId ? new OAuth2Client(googleClientId, googleClientSecret, googleRedirectUri) : null;
+const GOOGLE_PARTICIPANT_BY_EMAIL = {
+  'rahulkushwaha181@gmail.com': 'user-rahul',
+  'dileepkewat011@gmail.com': 'user-dileep',
+} as const;
 
 const SESSION_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30;
 
@@ -290,6 +293,11 @@ apiRouter.get('/auth/google/callback', async (req, res) => {
     }
 
     const providerSubject = payload.sub;
+    const googleEmail = payload.email.toLowerCase().trim();
+    const allowedParticipantId = GOOGLE_PARTICIPANT_BY_EMAIL[googleEmail as keyof typeof GOOGLE_PARTICIPANT_BY_EMAIL];
+    if (!allowedParticipantId || allowedParticipantId !== participantId) {
+      return res.status(403).send('Access Denied: this Google account is not authorized for the Great Coders challenge.');
+    }
     const existingIdentity = await getRuntimePool().query(
       `SELECT ai.participant_id, p.legacy_id FROM authentication_identities ai
        JOIN participants p ON p.id = ai.participant_id
@@ -354,12 +362,19 @@ apiRouter.post('/auth/google/bind', async (req, res) => {
       return res.status(400).json({ error: 'Google binding transaction is missing or expired.' });
     }
     const pending = bind.rows[0];
+    const allowedParticipantId = GOOGLE_PARTICIPANT_BY_EMAIL[String(pending.email).toLowerCase().trim() as keyof typeof GOOGLE_PARTICIPANT_BY_EMAIL];
+    if (!allowedParticipantId) {
+      return res.status(403).json({ error: 'Access Denied: this Google account is not authorized for the Great Coders challenge.' });
+    }
     const participant = await getRuntimePool().query(
       'SELECT legacy_id AS id, display_name AS name, email, avatar_url AS avatar, target_role AS "targetRole", bound_identity AS "boundIdentity" FROM participants WHERE id = $1 AND status = \'ACTIVE\'',
       [pending.participant_id]
     );
     if (!participant.rowCount) return res.status(404).json({ error: 'Participant not found.' });
     const participantId = participant.rows[0].id as string;
+    if (allowedParticipantId !== participantId) {
+      return res.status(403).json({ error: 'Access Denied: Google identity does not match the requested participant.' });
+    }
     const requestedParticipant = req.body?.participantId;
     if (requestedParticipant !== undefined && requestedParticipant !== participantId) {
       return res.status(403).json({ error: 'Participant identity is controlled by the OAuth transaction.' });
@@ -411,30 +426,7 @@ apiRouter.get('/auth/me', (req, res) => {
 });
 
 apiRouter.post('/auth/login', async (req, res) => {
-  const { email, password, googleAuth } = req.body;
-  const emailLower = (email || '').toLowerCase().trim();
-  try {
-    const result = await getRuntimePool().query(
-      `SELECT legacy_id AS id, display_name AS name, email, avatar_url AS avatar, target_role AS "targetRole", bound_identity AS "boundIdentity", password_hash AS "passwordHash"
-       FROM participants WHERE status = 'ACTIVE' AND (lower(email) = $1 OR lower(display_name) = $1 OR legacy_id = $1) LIMIT 1`,
-      [emailLower]
-    );
-    const user = result.rows[0];
-    if (!user) return res.status(403).json({ error: 'Access Denied: participant account not found.' });
-    if (password && !googleAuth && user.passwordHash && !bcrypt.compareSync(password, user.passwordHash)) {
-      return res.status(401).json({ error: 'Invalid password. (Default is password123)' });
-    }
-    await getRuntimePool().query(
-      `INSERT INTO audit_logs (actor_participant_id, action, entity_type, reason, created_at)
-       SELECT id, 'USER_LOGIN', 'SESSION', 'Participant login', $2 FROM participants WHERE legacy_id = $1`,
-      [user.id, getISTNow().toISOString()]
-    );
-    await setAuthCookie(res, user.id);
-    const { passwordHash: _passwordHash, ...userClean } = user;
-    return res.json({ user: userClean, message: `Welcome back, ${user.name}! Account locked to your identity.` });
-  } catch (error) {
-    return res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
-  }
+  return res.status(403).json({ error: 'Access Denied: Google OAuth is required.' });
 });
 
 apiRouter.get('/auth/me', (req, res) => {

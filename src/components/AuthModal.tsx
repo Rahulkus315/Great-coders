@@ -8,9 +8,6 @@ interface AuthModalProps {
 }
 
 export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onLoginSuccess }) => {
-  const [authMode, setAuthMode] = useState<'GOOGLE' | 'EMAIL'>('GOOGLE');
-  const [email, setEmail] = useState('rahulkushwha181@gmail.com');
-  const [password, setPassword] = useState('rahul@316');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingBinding, setPendingBinding] = useState<null | {
@@ -74,30 +71,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onLoginSuccess }) 
     }
   };
 
-  const handleEmailLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Login failed');
-      }
-
-      onLoginSuccess(data.user);
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 backdrop-blur-md p-4 animate-in fade-in duration-200">
       <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 sm:p-8 space-y-6">
@@ -131,32 +104,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onLoginSuccess }) 
             <span>{error}</span>
           </div>
         )}
-
-        {/* Auth Mode Switch */}
-        <div className="grid grid-cols-2 p-1 bg-slate-950 rounded-xl border border-slate-800 text-xs font-semibold">
-          <button
-            type="button"
-            onClick={() => setAuthMode('GOOGLE')}
-            className={`py-2 rounded-lg transition-all cursor-pointer ${
-              authMode === 'GOOGLE'
-                ? 'bg-slate-800 text-slate-100 shadow'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            Google Sign-In
-          </button>
-          <button
-            type="button"
-            onClick={() => setAuthMode('EMAIL')}
-            className={`py-2 rounded-lg transition-all cursor-pointer ${
-              authMode === 'EMAIL'
-                ? 'bg-slate-800 text-slate-100 shadow'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            Email & Password
-          </button>
-        </div>
 
         {/* Google Auth Flow */}
         {pendingBinding ? (
@@ -193,7 +140,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onLoginSuccess }) 
               </button>
             </div>
           </div>
-        ) : authMode === 'GOOGLE' ? (
+        ) : (
           <div className="space-y-3">
             <button
               type="button"
@@ -248,45 +195,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onLoginSuccess }) 
               <ArrowRight className="w-4 h-4 text-slate-400 group-hover:text-indigo-400 group-hover:translate-x-0.5 transition-all" />
             </button>
           </div>
-        ) : (
-          <form onSubmit={handleEmailLogin} className="space-y-4">
-            <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1">
-                Authorized Competitor Email
-              </label>
-              <input
-                type="email"
-                value={email}
-                onChange={e => setEmail(e.target.value)}
-                required
-                placeholder="rahulkushwha181@gmail.com"
-                className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1">
-                Account Password
-              </label>
-              <input
-                type="password"
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                required
-                placeholder="••••••••"
-                className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-              <p className="text-[10px] text-slate-500 mt-1">Default test credential: rahul@316 / DileepK@011</p>
-            </div>
-
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 font-bold text-xs text-white shadow-md shadow-indigo-600/30 transition-all cursor-pointer flex items-center justify-center gap-2"
-            >
-              {loading ? 'Authenticating...' : 'Sign In & Lock Account'}
-            </button>
-          </form>
         )}
 
         {/* Footer Note */}
