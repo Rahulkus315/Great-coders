@@ -477,6 +477,24 @@ export default function App() {
   const partnerUser = dashboard.partnerUser;
   const currentProfile = profileSettings[currentUser.id] || getDefaultProfileSettings(currentUser);
   const partnerProfile = profileSettings[partnerUser.id] || getDefaultProfileSettings(partnerUser);
+  const fallbackJournal: DailyJournal = {
+    id: '',
+    userId: currentUser.id,
+    date: dashboard.dayInfo.currentDate,
+    todayRoutine: '',
+    whatILearned: '',
+    whatIBuilt: '',
+    whatIStruggledWith: '',
+    mistakes: '',
+    tomorrowImprovements: '',
+    studyHours: 3,
+    energyRating: 4,
+    productivityRating: 4,
+    isShared: true,
+    status: 'OPEN',
+    updatedAt: new Date().toISOString(),
+  };
+  const journalForView = currentJournal ?? fallbackJournal;
 
   const tabs: Array<{ id: ActiveTab; label: string; icon: React.ReactNode; badge?: number | string }> = [
     { id: 'TODAY', label: "Today's Mission", icon: <Trophy className="w-4 h-4" /> },
@@ -768,9 +786,9 @@ export default function App() {
             />
           )}
 
-          {activeTab === 'JOURNAL' && currentJournal && (
+          {activeTab === 'JOURNAL' && (
             <JournalView
-              initialJournal={currentJournal}
+              initialJournal={journalForView}
               partnerJournal={partnerJournal}
               partnerName={partnerUser.name}
               currentDate={dashboard.dayInfo.currentDate}

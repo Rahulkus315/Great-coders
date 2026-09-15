@@ -162,15 +162,33 @@ export async function applyLeave(pool: Pool, legacyId: string, date: string, rea
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query("SELECT pg_advisory_xact_lock(hashtext($1 || ':leave'))", [legacyId]);
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2))", [legacyId, date]);
     const user = await participant(client, legacyId);
     const challengeDay = await day(client, date);
     const used = await client.query(`SELECT COUNT(*)::int AS count FROM holidays WHERE participant_id = $1 AND status = 'APPROVED'`, [user.id]);
     if (Number(used.rows[0].count) >= 5) throw new DailyActivityError(400, 'Leave quota exhausted!');
+    const existingSelfControl = await client.query(
+      `SELECT status FROM self_control_entries WHERE participant_id = $1 AND challenge_day_id = $2 FOR UPDATE`,
+      [user.id, challengeDay.id]
+    );
+    if (existingSelfControl.rows[0]?.status === 'REPORTED_RELAPSE') {
+      throw new DailyActivityError(409, 'A relapse has already been reported for this challenge day.');
+    }
+    const settled = await client.query(
+      `SELECT 1 FROM daily_settlements WHERE settlement_date = (SELECT calendar_date FROM challenge_days WHERE id = $1)`,
+      [challengeDay.id]
+    );
+    if (settled.rowCount) throw new DailyActivityError(409, 'This challenge day has already been finalized.');
     const inserted = await client.query(
       `INSERT INTO holidays (participant_id, challenge_id, challenge_day_id, holiday_number, status, reason)
        VALUES ($1, $2, $3, $4, 'APPROVED', $5) RETURNING id, reason, created_at AS "appliedAt"`,
       [user.id, challengeDay.challenge_id, challengeDay.id, Number(used.rows[0].count) + 1, reason || 'Personal Rest / Holiday']
+    );
+    await client.query(
+      `INSERT INTO self_control_entries (participant_id, challenge_day_id, status, recorded_at)
+       VALUES ($1, $2, 'HOLIDAY', $3)
+       ON CONFLICT (participant_id, challenge_day_id) DO UPDATE SET status = 'HOLIDAY', recorded_at = EXCLUDED.recorded_at`,
+      [user.id, challengeDay.id, getISTNow().toISOString()]
     );
     await client.query(
       `INSERT INTO points_ledger (participant_id, challenge_id, challenge_day_id, amount, event_type, reason, metadata, created_at)

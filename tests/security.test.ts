@@ -63,6 +63,16 @@ test('midnight settlement no longer depends on legacy frozenDays state', async (
   assert.doesNotMatch(source, /state\.pointLedger\.filter\(entry => entry\.userId === userId\)/i);
 });
 
+test('approval requests and responses no longer mutate the legacy runtime_state compatibility store', async () => {
+  const fs = await import('node:fs/promises');
+  const permissionSource = await fs.readFile(new URL('../server/permissionEngine.ts', import.meta.url), 'utf8');
+  const storeSource = await fs.readFile(new URL('../server/store.ts', import.meta.url), 'utf8');
+
+  assert.doesNotMatch(permissionSource, /state\.permissions\.unshift|state\.notifications\.unshift|state\.auditLogs\.unshift/);
+  assert.doesNotMatch(permissionSource, /Object\.assign\(req|Object\.assign\(target/);
+  assert.doesNotMatch(storeSource, /INSERT INTO runtime_state \(name, state_json, updated_at\)|ON CONFLICT \(name\)/i);
+});
+
 test('runtime store requires DATABASE_URL and fails fast without it', async () => {
   const { getRuntimePool } = await import('../server/store.ts');
   assert.throws(() => getRuntimePool({}), /DATABASE_URL is required/i);

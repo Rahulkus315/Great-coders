@@ -1,5 +1,6 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
+import crypto from 'node:crypto';
 import { OAuth2Client } from 'google-auth-library';
 import { getRuntimePool, store } from './store';
 import { calculateDayInfo, getISTDateString, getISTNow } from './timeUtils';
@@ -39,31 +40,43 @@ const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET || '';
 const googleRedirectUri = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/auth/google/callback';
 const googleClient = googleClientId ? new OAuth2Client(googleClientId, googleClientSecret, googleRedirectUri) : null;
 
-function setAuthCookie(res: express.Response, userId: string) {
+const SESSION_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30;
+
+async function setAuthCookie(res: express.Response, userId: string) {
   const secure = process.env.NODE_ENV === 'production';
-  res.cookie('session_user_id', userId, {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  await getRuntimePool().query(
+    `INSERT INTO auth_sessions (session_token_hash, participant_id, expires_at)
+     SELECT $1, id, now() + interval '30 days' FROM participants WHERE legacy_id = $2 AND status = 'ACTIVE'`,
+    [tokenHash, userId]
+  );
+  res.cookie('session_token', token, {
     httpOnly: true,
     secure,
     sameSite: 'lax',
-    maxAge: 1000 * 60 * 60 * 24 * 30,
+    maxAge: SESSION_MAX_AGE_MS,
   });
 }
 
-function clearAuthCookie(res: express.Response) {
+async function clearAuthCookie(req: express.Request, res: express.Response) {
   const secure = process.env.NODE_ENV === 'production';
+  const token = req.cookies?.session_token;
+  if (typeof token === 'string') {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    await getRuntimePool().query('UPDATE auth_sessions SET revoked_at = now() WHERE session_token_hash = $1', [tokenHash]);
+  }
   res.clearCookie('session_user_id', {
     httpOnly: true,
     secure,
     sameSite: 'lax',
   });
+  res.clearCookie('session_token', { httpOnly: true, secure, sameSite: 'lax' });
 }
 
 function getSessionUserId(req: express.Request) {
-  const sessionId = req.cookies?.session_user_id;
-  if (typeof sessionId === 'string' && (sessionId === 'user-rahul' || sessionId === 'user-dileep')) {
-    return sessionId;
-  }
-  return null;
+  const sessionId = (req as express.Request & { authenticatedLegacyId?: string }).authenticatedLegacyId;
+  return typeof sessionId === 'string' ? sessionId : null;
 }
 
 function getDefaultProfile(user: { id: string; name: string; avatar: string; targetRole?: string }) {
@@ -86,7 +99,7 @@ function isAllowedRequestOrigin(req: express.Request) {
   const origin = req.get('origin') || (req.get('referer') ? new URL(req.get('referer')!).origin : '');
   if (!origin) return process.env.NODE_ENV !== 'production';
   const configured = (process.env.APP_ORIGIN || '').split(',').map(value => value.trim()).filter(Boolean);
-  const allowed = new Set(configured.length ? configured : ['http://localhost:3000', 'http://localhost:5173']);
+  const allowed = new Set(configured.length ? configured : ['http://localhost:3000', 'http://0.0.0.0:3000', 'http://localhost:5173']);
   return allowed.has(origin);
 }
 
@@ -130,6 +143,28 @@ apiRouter.use((req, res, next) => {
     });
   }
 
+  next();
+});
+
+apiRouter.use(async (req, _res, next) => {
+  const token = req.cookies?.session_token;
+  if (typeof token !== 'string') return next();
+  try {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const result = await getRuntimePool().query(
+      `SELECT p.legacy_id
+       FROM auth_sessions s JOIN participants p ON p.id = s.participant_id
+       WHERE s.session_token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > now() AND p.status = 'ACTIVE'`,
+      [tokenHash]
+    );
+    const request = req as express.Request & { authenticatedLegacyId?: string };
+    request.authenticatedLegacyId = result.rows[0]?.legacy_id;
+    if (result.rowCount) {
+      await getRuntimePool().query('UPDATE auth_sessions SET last_seen_at = now() WHERE session_token_hash = $1', [tokenHash]);
+    }
+  } catch (error) {
+    console.error('Session lookup failed:', error instanceof Error ? error.message : String(error));
+  }
   next();
 });
 
@@ -186,7 +221,7 @@ export function buildUserExport(state: AppState, userId: string) {
 // ----------------------------------------------------------------------
 // 1. AUTHENTICATION & IDENTITY LOCKING
 // ----------------------------------------------------------------------
-apiRouter.get('/auth/google/start', (req, res) => {
+apiRouter.get('/auth/google/start', async (req, res) => {
   if (!googleClient) {
     return res.status(500).json({
       error: 'Google OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI.',
@@ -194,12 +229,19 @@ apiRouter.get('/auth/google/start', (req, res) => {
   }
 
   const participantId = req.query.participant === 'user-dileep' ? 'user-dileep' : 'user-rahul';
+  const stateToken = crypto.randomBytes(32).toString('base64url');
+  const stateHash = crypto.createHash('sha256').update(stateToken).digest('hex');
+  await getRuntimePool().query(
+    `INSERT INTO oauth_states (state_token_hash, participant_id, expires_at)
+     SELECT $1, id, now() + interval '10 minutes' FROM participants WHERE legacy_id = $2 AND status = 'ACTIVE'`,
+    [stateHash, participantId]
+  );
   const authUrl = googleClient.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     include_granted_scopes: true,
     scope: ['openid', 'email', 'profile'],
-    state: JSON.stringify({ participantId }),
+    state: stateToken,
   });
 
   res.redirect(authUrl);
@@ -216,17 +258,17 @@ apiRouter.get('/auth/google/callback', async (req, res) => {
       return res.redirect('/?auth_error=' + encodeURIComponent('Google Sign-In failed. Please try again.'));
     }
 
-    let participantId: 'user-rahul' | 'user-dileep' = 'user-rahul';
-    if (state) {
-      try {
-        const parsed = JSON.parse(state);
-        if (parsed.participantId === 'user-dileep' || parsed.participantId === 'user-rahul') {
-          participantId = parsed.participantId;
-        }
-      } catch {
-        // ignore malformed state
-      }
-    }
+    if (!state) throw new Error('Google OAuth state is missing');
+    const stateHash = crypto.createHash('sha256').update(String(state)).digest('hex');
+    const oauthState = await getRuntimePool().query(
+      `UPDATE oauth_states SET consumed_at = now()
+       WHERE state_token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
+       RETURNING participant_id`, [stateHash]
+    );
+    if (!oauthState.rowCount) throw new Error('Google OAuth state is invalid or expired');
+    const participantRow = await getRuntimePool().query('SELECT legacy_id FROM participants WHERE id = $1 AND status = \'ACTIVE\'', [oauthState.rows[0].participant_id]);
+    if (!participantRow.rowCount) throw new Error('Requested challenge participant could not be found');
+    const participantId = participantRow.rows[0].legacy_id as 'user-rahul' | 'user-dileep';
 
     const { tokens } = await googleClient.getToken({
       code: String(code),
@@ -248,167 +290,115 @@ apiRouter.get('/auth/google/callback', async (req, res) => {
     }
 
     const providerSubject = payload.sub;
-    const stateStore = store.getState();
-    const existingIdentity = stateStore.authIdentities.find(
-      auth => auth.provider === 'GOOGLE' && auth.providerSubject === providerSubject
+    const existingIdentity = await getRuntimePool().query(
+      `SELECT ai.participant_id, p.legacy_id FROM authentication_identities ai
+       JOIN participants p ON p.id = ai.participant_id
+       WHERE ai.provider = 'GOOGLE' AND ai.provider_subject = $1`, [providerSubject]
     );
 
-    if (existingIdentity && existingIdentity.bindingStatus === 'PERMANENT') {
-      const user = stateStore.users.find(u => u.id === existingIdentity.participantId);
-      if (!user) {
-        throw new Error('Bound participant could not be found');
-      }
-      setAuthCookie(res, user.id);
-      stateStore.auditLogs.unshift({
-        id: `audit-google-login-${Date.now()}`,
-        actorId: user.id,
-        actorName: user.name,
-        action: 'LOGIN_SUCCESS',
-        targetType: 'SESSION',
-        targetId: user.id,
-        reason: `Google identity re-identified participant ${user.name} via stable provider subject`,
-        timestamp: getISTNow().toISOString(),
-      });
-      store.save();
+    if (existingIdentity.rowCount) {
+      if (existingIdentity.rows[0].legacy_id !== participantId) throw new Error('This Google account is already permanently associated with another participant');
+      await setAuthCookie(res, existingIdentity.rows[0].legacy_id);
       return res.redirect('/');
     }
 
-    const boundGoogleIdentities = stateStore.authIdentities.filter(
-      auth => auth.provider === 'GOOGLE' && auth.bindingStatus === 'PERMANENT'
-    );
-    if (boundGoogleIdentities.length >= 2) {
+    const boundGoogleIdentities = await getRuntimePool().query("SELECT count(*)::int AS count FROM authentication_identities WHERE provider = 'GOOGLE'");
+    if (Number(boundGoogleIdentities.rows[0].count) >= 2) {
       return res.redirect('/?auth_error=' + encodeURIComponent('Challenge registration is closed. This challenge supports only Rahul and Dileep.'));
     }
-
-    const subjectAlreadyBoundToAnotherParticipant = stateStore.authIdentities.some(
-      auth => auth.provider === 'GOOGLE' && auth.providerSubject === providerSubject && auth.bindingStatus === 'PERMANENT' && auth.participantId !== participantId
-    );
-    if (subjectAlreadyBoundToAnotherParticipant) {
-      return res.redirect('/?auth_error=' + encodeURIComponent('This Google account is already permanently associated with another challenge participant.'));
-    }
-
-    const participantAlreadyBound = stateStore.authIdentities.some(
-      auth => auth.provider === 'GOOGLE' && auth.bindingStatus === 'PERMANENT' && auth.participantId === participantId
-    );
-    if (participantAlreadyBound) {
+    const participantAlreadyBound = await getRuntimePool().query("SELECT 1 FROM authentication_identities ai JOIN participants p ON p.id=ai.participant_id WHERE ai.provider='GOOGLE' AND p.legacy_id=$1", [participantId]);
+    if (participantAlreadyBound.rowCount) {
       return res.redirect('/?auth_error=' + encodeURIComponent('This participant already has a permanently bound Google identity.'));
     }
 
+    const stateStore = store.getState();
     const bindTarget = stateStore.users.find(u => u.id === participantId);
     if (!bindTarget) {
       return res.redirect('/?auth_error=' + encodeURIComponent('Requested challenge participant could not be found.'));
     }
 
-    const pendingPayload = {
-      participantId,
-      providerSubject,
-      email: payload.email,
-      name: payload.name || bindTarget.name,
-      emailVerified: !!payload.email_verified,
-    };
+    const pendingToken = crypto.randomBytes(32).toString('base64url');
+    await getRuntimePool().query(
+      `INSERT INTO oauth_bind_transactions (transaction_token_hash, participant_id, provider, provider_subject, email, email_verified, expires_at)
+       SELECT $1, id, 'GOOGLE', $2, $3, $4, now() + interval '10 minutes' FROM participants WHERE legacy_id = $5`,
+      [crypto.createHash('sha256').update(pendingToken).digest('hex'), providerSubject, payload.email, !!payload.email_verified, participantId]
+    );
 
-    res.cookie('pending_google_bind', JSON.stringify(pendingPayload), {
+    res.cookie('pending_google_bind', pendingToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
       maxAge: 5 * 60 * 1000,
     });
 
-    return res.redirect(
-      '/?auth=bind&participant=' + participantId + '&providerSubject=' + encodeURIComponent(providerSubject) + '&email=' + encodeURIComponent(payload.email)
-    );
+    return res.redirect('/?auth=bind&participant=' + participantId + '&email=' + encodeURIComponent(payload.email));
   } catch (error: any) {
     console.error('Google callback error', error);
     return res.redirect('/?auth_error=' + encodeURIComponent('Google Sign-In failed. Please try again.'));
   }
 });
 
-apiRouter.post('/auth/google/bind', (req, res) => {
+apiRouter.post('/auth/google/bind', async (req, res) => {
+  const pendingToken = req.cookies?.pending_google_bind;
+  if (typeof pendingToken !== 'string') {
+    return res.status(400).json({ error: 'Google binding transaction is missing or expired.' });
+  }
   try {
-    const { participantId, providerSubject, email } = req.body as {
-      participantId?: string;
-      providerSubject?: string;
-      email?: string;
-    };
-
-    if (!participantId || !providerSubject || !['user-rahul', 'user-dileep'].includes(participantId)) {
-      return res.status(400).json({ error: 'Invalid participant binding request.' });
-    }
-
-    const state = store.getState();
-    const participant = state.users.find(u => u.id === participantId);
-    if (!participant) {
-      return res.status(404).json({ error: 'Participant not found.' });
-    }
-
-    const alreadyBoundBySubject = state.authIdentities.find(
-      auth => auth.provider === 'GOOGLE' && auth.providerSubject === providerSubject
+    const tokenHash = crypto.createHash('sha256').update(pendingToken).digest('hex');
+    const bind = await getRuntimePool().query(
+      `UPDATE oauth_bind_transactions SET consumed_at = now()
+       WHERE transaction_token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
+       RETURNING participant_id, provider, provider_subject, email, email_verified`, [tokenHash]
     );
-    if (alreadyBoundBySubject && alreadyBoundBySubject.bindingStatus === 'PERMANENT') {
-      if (alreadyBoundBySubject.participantId !== participantId) {
-        return res.status(409).json({ error: 'This Google account is already permanently associated with another challenge participant.' });
-      }
-      setAuthCookie(res, participant.id);
-      return res.json({ success: true, user: participant, message: `Welcome back, ${participant.name}.` });
+    if (!bind.rowCount || bind.rows[0].provider !== 'GOOGLE') {
+      return res.status(400).json({ error: 'Google binding transaction is missing or expired.' });
     }
-
-    const participantAlreadyBound = state.authIdentities.some(
-      auth => auth.provider === 'GOOGLE' && auth.bindingStatus === 'PERMANENT' && auth.participantId === participantId
+    const pending = bind.rows[0];
+    const participant = await getRuntimePool().query(
+      'SELECT legacy_id AS id, display_name AS name, email, avatar_url AS avatar, target_role AS "targetRole", bound_identity AS "boundIdentity" FROM participants WHERE id = $1 AND status = \'ACTIVE\'',
+      [pending.participant_id]
     );
-    if (participantAlreadyBound) {
-      return res.status(409).json({ error: 'This challenge participant already has a permanent Google binding.' });
+    if (!participant.rowCount) return res.status(404).json({ error: 'Participant not found.' });
+    const participantId = participant.rows[0].id as string;
+    const requestedParticipant = req.body?.participantId;
+    if (requestedParticipant !== undefined && requestedParticipant !== participantId) {
+      return res.status(403).json({ error: 'Participant identity is controlled by the OAuth transaction.' });
     }
-
-    const boundGoogleIdentities = state.authIdentities.filter(
-      auth => auth.provider === 'GOOGLE' && auth.bindingStatus === 'PERMANENT'
+    const conflict = await getRuntimePool().query(
+      `SELECT ai.participant_id FROM authentication_identities ai WHERE ai.provider = 'GOOGLE' AND ai.provider_subject = $1`,
+      [pending.provider_subject]
     );
-    if (boundGoogleIdentities.length >= 2) {
-      return res.status(403).json({ error: 'Challenge registration is closed. This challenge supports only Rahul and Dileep.' });
+    if (conflict.rowCount && conflict.rows[0].participant_id !== pending.participant_id) {
+      return res.status(409).json({ error: 'This Google account is already permanently associated with another participant.' });
     }
-
-    state.authIdentities = state.authIdentities.filter(
-      auth => !(auth.provider === 'GOOGLE' && auth.providerSubject === providerSubject)
+    const participantBound = await getRuntimePool().query(
+      `SELECT 1 FROM authentication_identities WHERE provider = 'GOOGLE' AND participant_id = $1`, [pending.participant_id]
     );
-
-    const identityEntry = {
-      id: `auth-google-${Date.now()}`,
-      provider: 'GOOGLE' as const,
-      providerSubject,
-      email: String(email || ''),
-      emailVerified: true,
-      participantId: participantId as 'user-rahul' | 'user-dileep',
-      bindingStatus: 'PERMANENT' as const,
-      createdAt: new Date().toISOString(),
-      lastLoginAt: new Date().toISOString(),
-    };
-
-    state.authIdentities.push(identityEntry);
-    setAuthCookie(res, participant.id);
-    state.auditLogs.unshift({
-      id: `audit-google-bind-${Date.now()}`,
-      actorId: participant.id,
-      actorName: participant.name,
-      action: 'PARTICIPANT_BOUND',
-      targetType: 'AUTH_IDENTITY',
-      targetId: identityEntry.id,
-      reason: `Google account permanently bound to ${participant.name} using stable Google subject ${providerSubject}`,
-      timestamp: getISTNow().toISOString(),
-    });
-    store.save();
-
-    const { passwordHash: _passwordHash, ...userClean } = participant;
+    if (participantBound.rowCount && !conflict.rowCount) {
+      return res.status(409).json({ error: 'This participant already has a permanent Google binding.' });
+    }
+    const identity = await getRuntimePool().query(
+      `INSERT INTO authentication_identities (provider, provider_subject, email, email_verified, participant_id, last_login_at)
+       VALUES ('GOOGLE', $1, $2, $3, $4, now())
+       ON CONFLICT (provider, provider_subject) DO UPDATE SET last_login_at = now()
+       RETURNING id`, [pending.provider_subject, pending.email, pending.email_verified, pending.participant_id]
+    );
+    await setAuthCookie(res, participantId);
+    res.clearCookie('pending_google_bind');
+    const userClean = participant.rows[0];
     return res.json({
       success: true,
       user: userClean,
-      message: `Welcome, ${participant.name}! Your Google account is permanently bound to this challenge identity.`,
+      message: `Welcome, ${userClean.name}! Your Google account is permanently bound to this challenge identity.`,
+      identityId: identity.rows[0].id,
     });
   } catch (err: any) {
     return res.status(500).json({ error: err.message || 'Google binding failed.' });
   }
 });
 
-apiRouter.post('/auth/logout', (req, res) => {
-  clearAuthCookie(res);
+apiRouter.post('/auth/logout', async (req, res) => {
+  await clearAuthCookie(req, res);
   res.json({ success: true, message: 'Logged out successfully.' });
 });
 
@@ -439,7 +429,7 @@ apiRouter.post('/auth/login', async (req, res) => {
        SELECT id, 'USER_LOGIN', 'SESSION', 'Participant login', $2 FROM participants WHERE legacy_id = $1`,
       [user.id, getISTNow().toISOString()]
     );
-    setAuthCookie(res, user.id);
+    await setAuthCookie(res, user.id);
     const { passwordHash: _passwordHash, ...userClean } = user;
     return res.json({ user: userClean, message: `Welcome back, ${user.name}! Account locked to your identity.` });
   } catch (error) {
@@ -508,10 +498,11 @@ apiRouter.get('/dashboard', async (req, res) => {
     const currentUser = requireAuthUser(req, res);
     if (!currentUser) return;
 
+    await store.refreshFromDatabase();
     const state = store.getState();
     const dayInfo = calculateDayInfo();
     await settleMorningCheckinsForDate(dayInfo.currentDate);
-    const overview = getCompetitionOverview();
+    const overview = await getCompetitionOverview();
     const partnerUser = state.users.find(u => u.id !== currentUser.id) || state.users[1];
     const currentWakeStats = await getWakeUpStats(getRuntimePool(), currentUser.id);
     const partnerWakeStats = await getWakeUpStats(getRuntimePool(), partnerUser.id);
@@ -603,8 +594,10 @@ apiRouter.get('/dashboard', async (req, res) => {
     const currentProfile = state.profiles?.[currentUser.id] || getDefaultProfile(currentUser);
     const partnerProfile = state.profiles?.[partnerUser.id] || getDefaultProfile(partnerUser);
 
-    const myCheckinStats = calculateCheckinStats(currentUser.id);
-    const partnerCheckinStats = calculateCheckinStats(partnerUser.id);
+    const [myCheckinStats, partnerCheckinStats] = await Promise.all([
+      calculateCheckinStats(currentUser.id),
+      calculateCheckinStats(partnerUser.id),
+    ]);
     const myStreak = myCheckinStats.currentStreak;
     const daysUntilBonus = myStreak > 0 && myStreak % 7 === 0 ? 0 : 7 - (myStreak % 7);
 
@@ -825,9 +818,39 @@ apiRouter.post('/leaves/apply', async (req, res) => {
   }
 });
 
-// Legacy implementations remain unreachable under these internal paths while
-// their response contracts are retired from the live API.
-apiRouter.post('/legacy/checkin', (req, res) => {
+// Compatibility aliases delegate to PostgreSQL-backed services.
+apiRouter.post('/legacy/checkin', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const result = await recordDailyCheckin(getRuntimePool(), userId);
+    return res.json({ success: !result.alreadyCheckedIn, alreadyCheckedIn: result.alreadyCheckedIn, checkin: result.checkin, dailyCheckinInfo: result.stats });
+  } catch (error) { return res.status(error instanceof DailyActivityError ? error.statusCode : 500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+apiRouter.get('/legacy/checkin/status', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const state = store.getState(); const partner = state.users.find(user => user.id !== userId) || state.users[1];
+    const [mine, theirs] = await Promise.all([getDailyCheckinStats(getRuntimePool(), userId), getDailyCheckinStats(getRuntimePool(), partner.id)]);
+    return res.json({ myCheckin: mine.todayCheckin, partnerCheckin: theirs.todayCheckin, myStreak: mine.currentStreak, partnerStreak: theirs.currentStreak, hasCheckedInToday: mine.hasCheckedInToday, partnerHasCheckedInToday: theirs.hasCheckedInToday, daysUntilBonus: mine.currentStreak > 0 && mine.currentStreak % 7 === 0 ? 0 : 7 - (mine.currentStreak % 7), totalCoins: mine.totalCoins, partnerName: partner.name });
+  } catch (error) { return res.status(error instanceof DailyActivityError ? error.statusCode : 500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+apiRouter.get('/legacy/leaves', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { const state = store.getState(); const partner = state.users.find(user => user.id !== userId) || state.users[1]; return res.json(await listLeaves(getRuntimePool(), userId, partner.id)); }
+  catch (error) { return res.status(error instanceof DailyActivityError ? error.statusCode : 500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+apiRouter.post('/legacy/leaves/apply', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { const leave = await applyLeave(getRuntimePool(), userId, req.body.date || calculateDayInfo().currentDate, req.body.reason || 'Personal Rest / Holiday'); return res.json({ success: true, leave, remainingLeaves: leave.remainingLeaves, leavesUsed: leave.leavesUsed }); }
+  catch (error) { return res.status(error instanceof DailyActivityError ? error.statusCode : 500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+// Older implementations below are retained only as unreachable source history.
+apiRouter.post('/legacy/checkin', async (req, res) => {
   try {
     const user = requireAuthUser(req, res);
     if (!user) return;
@@ -844,9 +867,9 @@ apiRouter.post('/legacy/checkin', (req, res) => {
     // 1. Check if user already checked in today
     const existing = state.dailyCheckins.find(c => c.userId === user.id && c.date === currentDate);
     if (existing) {
-      const myCheckinStats = calculateCheckinStats(user.id);
+      const myCheckinStats = await calculateCheckinStats(user.id);
       const partnerUser = state.users.find(u => u.id !== user.id) || state.users[1];
-      const partnerCheckinStats = calculateCheckinStats(partnerUser.id);
+      const partnerCheckinStats = await calculateCheckinStats(partnerUser.id);
       const daysUntilBonus = myCheckinStats.currentStreak > 0 && myCheckinStats.currentStreak % 7 === 0 ? 0 : 7 - (myCheckinStats.currentStreak % 7);
 
       return res.json({
@@ -976,8 +999,7 @@ apiRouter.post('/legacy/checkin', (req, res) => {
 
     store.save();
 
-    const myCheckinStats = calculateCheckinStats(user.id);
-    const partnerCheckinStats = calculateCheckinStats(partnerUser.id);
+    const [myCheckinStats, partnerCheckinStats] = await Promise.all([calculateCheckinStats(user.id), calculateCheckinStats(partnerUser.id)]);
     const daysUntilBonus = newStreak > 0 && newStreak % 7 === 0 ? 0 : 7 - (newStreak % 7);
 
     res.json({
@@ -1008,7 +1030,7 @@ apiRouter.post('/legacy/checkin', (req, res) => {
   }
 });
 
-apiRouter.get('/legacy/checkin/status', (req, res) => {
+apiRouter.get('/legacy/checkin/status', async (req, res) => {
   try {
     const user = requireAuthUser(req, res);
     if (!user) return;
@@ -1016,8 +1038,7 @@ apiRouter.get('/legacy/checkin/status', (req, res) => {
     const state = store.getState();
     const partnerUser = state.users.find(u => u.id !== user.id) || state.users[1];
 
-    const myCheckinStats = calculateCheckinStats(user.id);
-    const partnerCheckinStats = calculateCheckinStats(partnerUser.id);
+    const [myCheckinStats, partnerCheckinStats] = await Promise.all([calculateCheckinStats(user.id), calculateCheckinStats(partnerUser.id)]);
     const daysUntilBonus = myCheckinStats.currentStreak > 0 && myCheckinStats.currentStreak % 7 === 0 ? 0 : 7 - (myCheckinStats.currentStreak % 7);
 
     res.json({
@@ -1166,10 +1187,11 @@ apiRouter.post('/legacy/leaves/apply', (req, res) => {
 // ----------------------------------------------------------------------
 // 3. ROADMAP & CURRICULUM
 // ----------------------------------------------------------------------
-apiRouter.get('/roadmap', (req, res) => {
+apiRouter.get('/roadmap', async (req, res) => {
   const currentUser = requireAuthUser(req, res);
   if (!currentUser) return;
 
+  await store.refreshFromDatabase();
   const state = store.getState();
   const dayInfo = calculateDayInfo();
 
@@ -1223,11 +1245,12 @@ apiRouter.get('/roadmap', (req, res) => {
   });
 });
 
-apiRouter.get('/roadmap/days/:day', (req, res) => {
+apiRouter.get('/roadmap/days/:day', async (req, res) => {
   const currentUser = requireAuthUser(req, res);
   if (!currentUser) return;
 
   const dayNum = parseInt(req.params.day, 10);
+  await store.refreshFromDatabase();
   const state = store.getState();
   const dayInfo = calculateDayInfo();
 
@@ -1270,11 +1293,12 @@ apiRouter.get('/roadmap/days/:day', (req, res) => {
 // ----------------------------------------------------------------------
 // 3B. COMPREHENSIVE HISTORICAL DAY ARCHIVE & CALENDAR OVERVIEW
 // ----------------------------------------------------------------------
-apiRouter.get('/history/calendar-overview', (req, res) => {
+apiRouter.get('/history/calendar-overview', async (req, res) => {
   try {
     const currentUser = requireAuthUser(req, res);
     if (!currentUser) return;
 
+    await store.refreshFromDatabase();
     const state = store.getState();
     const partnerUser = state.users.find(u => u.id !== currentUser.id) || state.users[1];
     const dayInfo = calculateDayInfo();
@@ -1344,12 +1368,13 @@ apiRouter.get('/history/calendar-overview', (req, res) => {
   }
 });
 
-apiRouter.get('/day/:day', (req, res) => {
+apiRouter.get('/day/:day', async (req, res) => {
   try {
     const currentUser = requireAuthUser(req, res);
     if (!currentUser) return;
 
     const dayNum = parseInt(req.params.day, 10);
+    await store.refreshFromDatabase();
     const state = store.getState();
     const partnerUser = state.users.find(u => u.id !== currentUser.id) || state.users[1];
     const dayInfo = calculateDayInfo();
@@ -1472,11 +1497,12 @@ apiRouter.get('/day/:day', (req, res) => {
 });
 
 // Request partner approval for a past day's task that was left incomplete
-apiRouter.post('/day/:day/request-approval', (req, res) => {
+apiRouter.post('/day/:day/request-approval', async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day, 10);
     const { reason } = req.body;
-    const currentUser = getAuthUser(req);
+    const currentUser = requireAuthUser(req, res);
+    if (!currentUser) return;
     const state = store.getState();
     const dayInfo = calculateDayInfo();
 
@@ -1499,7 +1525,7 @@ apiRouter.post('/day/:day/request-approval', (req, res) => {
     }
 
     // Create permission request
-    const request = createPermissionRequest(
+    const request = await createPermissionRequest(
       currentUser.id,
       'RETROACTIVE_COMPLETION',
       task.id,
@@ -1517,7 +1543,7 @@ apiRouter.post('/day/:day/request-approval', (req, res) => {
   }
 });
 
-apiRouter.post('/future-schedule-request', (req, res) => {
+apiRouter.post('/future-schedule-request', async (req, res) => {
   try {
     const { entityId, entityType = 'TASK', proposedDay, reason } = req.body || {};
     const currentUser = requireAuthUser(req, res);
@@ -1564,7 +1590,7 @@ apiRouter.post('/future-schedule-request', (req, res) => {
       return res.status(429).json({ error: `This request is blocked by the 12-hour cooldown. ${cooldown.remainingText}` });
     }
 
-    const request = createPermissionRequest(
+    const request = await createPermissionRequest(
       currentUser.id,
       'SCHEDULE_CHANGE',
       entityId,
@@ -1590,10 +1616,11 @@ apiRouter.post('/future-schedule-request', (req, res) => {
 // ----------------------------------------------------------------------
 // 4. DAILY TASKS & COMPLETIONS
 // ----------------------------------------------------------------------
-apiRouter.get('/tasks/today', (req, res) => {
+apiRouter.get('/tasks/today', async (req, res) => {
   const currentUser = requireAuthUser(req, res);
   if (!currentUser) return;
 
+  await store.refreshFromDatabase();
   const state = store.getState();
   const dayInfo = calculateDayInfo();
 
@@ -1638,7 +1665,7 @@ apiRouter.post('/tasks/:id/complete', async (req, res) => {
 });
 
 // Reversal Request (Section 21)
-const handleReversalRequest = (req: any, res: any) => {
+const handleReversalRequest = async (req: any, res: any) => {
   const currentUser = requireAuthUser(req, res);
   if (!currentUser) return;
 
@@ -1659,7 +1686,7 @@ const handleReversalRequest = (req: any, res: any) => {
   }
 
   try {
-    const request = createPermissionRequest(
+    const request = await createPermissionRequest(
       currentUser.id,
       'TASK_REVERSAL',
       taskId,
@@ -1676,8 +1703,8 @@ const handleReversalRequest = (req: any, res: any) => {
   }
 };
 
-apiRouter.post('/tasks/:id/reversal-request', handleReversalRequest);
-apiRouter.post('/tasks/:id/reversal', handleReversalRequest);
+apiRouter.post('/tasks/:id/reversal-request', async (req, res) => await handleReversalRequest(req, res));
+apiRouter.post('/tasks/:id/reversal', async (req, res) => await handleReversalRequest(req, res));
 
 // ----------------------------------------------------------------------
 // 5. DSA PROBLEM SOLVING
@@ -1722,6 +1749,20 @@ apiRouter.post('/dsa/attempt', async (req, res) => {
   }
 });
 
+apiRouter.get('/legacy/dsa/today', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const day = calculateDayInfo().dayNumber;
+    const problem = (await getRuntimePool().query(
+      `SELECT dp.legacy_id AS id, dp.title, dp.category, dp.difficulty, dp.points, dp.leetcode_url AS "leetcodeUrl", dp.description, dp.approach, dp.time_complexity AS "timeComplexity", dp.space_complexity AS "spaceComplexity"
+       FROM dsa_problems dp JOIN challenge_days cd ON cd.id=dp.challenge_day_id WHERE cd.curriculum_day_number=$1`, [day]
+    )).rows[0];
+    if (!problem) return res.status(404).json({ error: 'No DSA problem found for today' });
+    const attempt = await getDsaAttempt(getRuntimePool(), userId, problem.id);
+    return res.json({ problem, attempt, isSolved: attempt?.status === 'SOLVED' });
+  } catch (error) { return res.status(error instanceof DsaServiceError ? error.statusCode : 500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
 apiRouter.get('/legacy/dsa/today', (req, res) => {
   const currentUser = requireAuthUser(req, res);
   if (!currentUser) return;
@@ -1813,8 +1854,18 @@ const handleDsaAttempt = (req: any, res: any) => {
   });
 };
 
-apiRouter.post('/legacy/dsa/:id/attempt', handleDsaAttempt);
-apiRouter.post('/legacy/dsa/attempt', handleDsaAttempt);
+apiRouter.post('/legacy/dsa/:id/attempt', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { const result = await recordDsaAttempt(getRuntimePool(), userId, req.params.id, req.body.status || 'SOLVED', req.body.timeTakenMinutes, req.body.notes, req.body.codeSnippet); return res.json({ success: true, attempt: result.attempt, pointsAwarded: result.pointsAwarded }); }
+  catch (error) { return res.status(error instanceof DsaServiceError ? error.statusCode : 500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+apiRouter.post('/legacy/dsa/attempt', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try { const result = await recordDsaAttempt(getRuntimePool(), userId, req.body.problemId, req.body.status || 'SOLVED', req.body.timeTakenMinutes, req.body.notes, req.body.codeSnippet); return res.json({ success: true, attempt: result.attempt, pointsAwarded: result.pointsAwarded }); }
+  catch (error) { return res.status(error instanceof DsaServiceError ? error.statusCode : 500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
 
 // ----------------------------------------------------------------------
 // 6. SCORE LEDGER (Section 26)
@@ -1856,15 +1907,15 @@ apiRouter.get('/ledger', async (req, res) => {
 // ----------------------------------------------------------------------
 // 7. HABIT & SELF-CONTROL TRACKER (Sections 28 & 29)
 // ----------------------------------------------------------------------
-const handleGetHabits = (req: any, res: any) => {
+const handleGetHabits = async (req: any, res: any) => {
   const currentUser = requireAuthUser(req, res);
   if (!currentUser) return;
 
   const state = store.getState();
 
-  const userStats = calculateHabitStats(currentUser.id);
+  const userStats = await calculateHabitStats(currentUser.id);
   const partnerUser = state.users.find(u => u.id !== currentUser.id)!;
-  const partnerStats = calculateHabitStats(partnerUser.id);
+  const partnerStats = await calculateHabitStats(partnerUser.id);
 
   // Private history for current user only
   const myHistory = state.habits
@@ -1914,7 +1965,7 @@ apiRouter.get('/habits', async (req, res, next) => {
 });
 apiRouter.get('/habit', (_req, res) => res.redirect(307, '/api/habits'));
 
-const handleHabitCheckin = (req: any, res: any) => {
+const handleHabitCheckin = async (req: any, res: any) => {
   const currentUser = requireAuthUser(req, res);
   if (!currentUser) return;
 
@@ -1953,7 +2004,7 @@ const handleHabitCheckin = (req: any, res: any) => {
     state.habits.push(todayEntry);
   }
 
-  const updatedStats = calculateHabitStats(currentUser.id);
+  const updatedStats = await calculateHabitStats(currentUser.id);
   store.save();
 
   res.json({
@@ -1966,6 +2017,12 @@ const handleHabitCheckin = (req: any, res: any) => {
 apiRouter.post('/habits/check-in', async (req, res) => {
   const userId = getSessionUserId(req);
   if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  if (req.body.participantId !== undefined && req.body.participantId !== userId) {
+    return res.status(403).json({ error: 'Participant identity is controlled by the authenticated session.' });
+  }
+  if (req.body.streak !== undefined || req.body.currentStreak !== undefined || req.body.bestStreak !== undefined) {
+    return res.status(400).json({ error: 'Streak values are calculated by the server.' });
+  }
   if (!req.body.confirmed || req.body.status !== 'REPORTED_RELAPSE') return res.status(400).json({ error: 'Confirmation required before recording today\'s self-control status.' });
   try { const result = await recordRelapse(getRuntimePool(), userId, req.body.notes || ''); return res.json({ success: true, message: 'Today\'s status has been recorded.', stats: result.myStats }); }
   catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
@@ -2039,12 +2096,12 @@ const handleGetJournal = (req: any, res: any) => {
 
 apiRouter.get('/journal/today', async (req, res) => {
   const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
-  try { const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1]; const date = (req.query.date as string) || calculateDayInfo().currentDate; const result = await getJournalData(getRuntimePool(), userId, partner.id, date); return res.json({ ...result, journalStatus: 'OPEN', journalDate: date, currentServerTime: getISTNow().toISOString(), isLocked: false }); }
+  try { const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1]; const date = (req.query.date as string) || calculateDayInfo().currentDate; const result = await getJournalData(getRuntimePool(), userId, partner.id, date); return res.json({ ...result, journalStatus: 'OPEN', journalDate: result.journal.date, currentServerTime: getISTNow().toISOString(), isLocked: false }); }
   catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
 });
 apiRouter.get('/journal', async (req, res) => {
   const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
-  try { const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1]; const date = (req.query.date as string) || calculateDayInfo().currentDate; const result = await getJournalData(getRuntimePool(), userId, partner.id, date); return res.json({ ...result, journalStatus: 'OPEN', journalDate: date, currentServerTime: getISTNow().toISOString(), isLocked: false }); }
+  try { const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1]; const date = (req.query.date as string) || calculateDayInfo().currentDate; const result = await getJournalData(getRuntimePool(), userId, partner.id, date); return res.json({ ...result, journalStatus: 'OPEN', journalDate: result.journal.date, currentServerTime: getISTNow().toISOString(), isLocked: false }); }
   catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
 });
 
@@ -2103,10 +2160,19 @@ apiRouter.post('/legacy/todays-live/:id/focused-execution/finalize', (req, res) 
 
 apiRouter.post('/journal', async (req, res) => {
   const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
-  try { const date = req.body.date || calculateDayInfo().currentDate; const journal = await saveJournal(getRuntimePool(), userId, date, req.body); return res.json({ success: true, message: 'Today\'s Live saved securely.', journal, journalDate: date, journalStatus: journal.status, isLocked: false }); }
+  try { const date = req.body.date || calculateDayInfo().currentDate; const journal = await saveJournal(getRuntimePool(), userId, date, req.body); return res.json({ success: true, message: 'Today\'s Live saved securely.', journal, journalDate: journal.date, journalStatus: journal.status, isLocked: false }); }
   catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
 });
 
+apiRouter.post('/legacy/journal', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  try {
+    const date = req.body.date || calculateDayInfo().currentDate;
+    const journal = await saveJournal(getRuntimePool(), userId, date, req.body);
+    return res.json({ success: true, message: "Today's Live saved securely.", journal, journalDate: journal.date, journalStatus: journal.status, isLocked: false });
+  } catch (error) { return res.status(error instanceof HabitJournalError ? error.statusCode : 500).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
 apiRouter.post('/legacy/journal', (req, res) => {
   const currentUser = requireAuthUser(req, res);
   if (!currentUser) return;
@@ -2223,6 +2289,10 @@ apiRouter.post('/legacy/journal', (req, res) => {
     journal = newJournal;
   }
 
+  if (!journal) {
+    return res.status(500).json({ error: 'Today\'s Live record could not be created.' });
+  }
+
   state.auditLogs.unshift({
     id: `audit-journal-${Date.now()}`,
     actorId: currentUser.id,
@@ -2244,94 +2314,76 @@ apiRouter.post('/legacy/journal', (req, res) => {
   });
 });
 
-apiRouter.post('/journal/rate-partner', (req, res) => {
-  const currentUser = requireAuthUser(req, res);
-  if (!currentUser) return;
+apiRouter.post('/journal/rate-partner', async (req, res) => {
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required.' });
 
-  const state = store.getState();
-  const dayInfo = calculateDayInfo();
-  const nowIso = getISTNow().toISOString();
-  const { date, rating } = req.body;
-  const targetDate = date || dayInfo.currentDate;
-  const ratingNum = Math.min(5, Math.max(1, parseInt(rating, 10) || 5));
-
-  const partner = state.users.find(u => u.id !== currentUser.id);
-  if (!partner) return res.status(404).json({ error: 'Partner not found' });
-
-  const partnerJournal = state.journals.find(j => j.userId === partner.id && j.date === targetDate);
-  if (!partnerJournal) {
-    return res.status(404).json({ error: 'Partner Today\'s Live entry was not found for the selected date.' });
+  const targetDate = String(req.body?.date || calculateDayInfo().currentDate);
+  const ratingNum = Number(req.body?.rating);
+  if (!Number.isInteger(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+    return res.status(400).json({ error: 'Rating must be an integer from 1 to 5.' });
   }
 
-  if (partnerJournal.peerReviewRating && partnerJournal.peerRaterId && partnerJournal.peerRaterId !== currentUser.id) {
-    return res.status(409).json({ error: 'This Today\'s Live entry already has a permanent partner rating.' });
+  const pool = getRuntimePool();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const users = await client.query(
+      `SELECT id, legacy_id, display_name FROM participants WHERE status='ACTIVE' AND legacy_id = ANY($1::text[]) FOR SHARE`,
+      [[userId, userId === 'user-rahul' ? 'user-dileep' : 'user-rahul']]
+    );
+    const partner = users.rows.find((row: any) => row.legacy_id !== userId);
+    if (!partner) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Partner not found.' }); }
+    const journal = await client.query(
+      `SELECT tl.id, p.legacy_id AS "userId", cd.calendar_date::text AS date, tl.summary, tl.summary AS "todayRoutine", tl.what_i_learned AS "whatILearned", tl.what_i_built AS "whatIBuilt", tl.what_i_struggled_with AS "whatIStruggledWith", tl.mistakes, tl.mistakes_lessons AS "mistakesLessons", tl.tomorrow_focus AS "tomorrowFocus", tl.tomorrow_focus AS "tomorrowImprovements", tl.additional_notes AS "additionalNotes", tl.study_hours AS "studyHours", tl.status, tl.updated_at AS "updatedAt"
+       FROM todays_live tl JOIN participants p ON p.id=tl.participant_id JOIN challenge_days cd ON cd.id=tl.challenge_day_id
+       WHERE tl.participant_id=$1 AND cd.calendar_date=$2 FOR UPDATE`, [partner.id, targetDate]
+    );
+    if (!journal.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Partner Today\'s Live entry was not found for the selected date.' }); }
+    const inserted = await client.query(
+      `INSERT INTO todays_live_ratings (todays_live_id, rater_participant_id, stars)
+       VALUES ($1, (SELECT id FROM participants WHERE legacy_id=$2), $3)
+       ON CONFLICT (todays_live_id, rater_participant_id) DO NOTHING
+       RETURNING id`, [journal.rows[0].id, userId, ratingNum]
+    );
+    if (!inserted.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'You have already submitted a rating for this entry.' }); }
+    const nowIso = getISTNow().toISOString();
+    await client.query(
+      `INSERT INTO audit_logs (actor_participant_id, action, entity_type, entity_id, reason, created_at)
+       SELECT id, 'RATE_PARTNER_JOURNAL', 'TODAYS_LIVE', $1, 'Partner Today\'s Live rating submitted', $2 FROM participants WHERE legacy_id=$3`,
+      [journal.rows[0].id, nowIso, userId]
+    );
+    await client.query(
+      `INSERT INTO notifications (recipient_participant_id, notification_type, title, message, data, created_at)
+       VALUES ($1, 'APPROVAL_RESPONSE', 'Journal Rating Received', $2, $3::jsonb, $4)`,
+      [partner.id, `${userId} rated your Today's Live ${ratingNum}/5 stars.`, JSON.stringify({ rating: ratingNum, todaysLiveId: journal.rows[0].id }), nowIso]
+    );
+    await client.query('COMMIT');
+    return res.json({ success: true, message: `Today's Live rating submitted: ${ratingNum}/5 stars.`, partnerJournal: journal.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  } finally {
+    client.release();
   }
-
-  if (partnerJournal.peerReviewRating && partnerJournal.peerRaterId === currentUser.id) {
-    return res.status(409).json({ error: 'You have already submitted a rating for this entry.' });
-  }
-
-  if (getJournalLockState(targetDate).isLocked) {
-    return res.status(403).json({ error: 'This Today\'s Live entry is locked and can no longer receive a rating.' });
-  }
-
-  partnerJournal.peerReviewRating = ratingNum;
-  partnerJournal.peerReviewedAt = nowIso;
-  partnerJournal.peerRaterId = currentUser.id;
-  partnerJournal.updatedAt = nowIso;
-
-  state.auditLogs.unshift({
-    id: `audit-rating-${Date.now()}`,
-    actorId: currentUser.id,
-    actorName: currentUser.name,
-    action: 'RATE_PARTNER_JOURNAL',
-    targetType: 'TODAYS_LIVE',
-    targetId: `${partner.id}-${targetDate}`,
-    reason: `${currentUser.name} rated ${partner.name}'s Today's Live: ${ratingNum}/5 stars.`,
-    timestamp: nowIso,
-  });
-
-  state.notifications.unshift({
-    id: `notif-rating-${Date.now()}`,
-    userId: partner.id,
-    type: 'APPROVAL_RESPONSE',
-    title: '⭐ Journal Rating Received',
-    message: `${currentUser.name} rated your Today's Live ${ratingNum}/5 stars.`,
-    read: false,
-    createdAt: nowIso,
-  });
-
-  store.save();
-
-  res.json({
-    success: true,
-    message: `Today's Live rating submitted: ${ratingNum}/5 stars.`,
-    partnerJournal,
-  });
 });
 
 // ----------------------------------------------------------------------
 // 9. PERMISSION & APPROVAL WORKFLOW (Section 21, 22, 23)
 // ----------------------------------------------------------------------
-apiRouter.get('/permissions', (req, res) => {
+apiRouter.get('/permissions', async (req, res) => {
   const currentUser = requireAuthUser(req, res);
   if (!currentUser) return;
 
-  const state = store.getState();
-
-  // Requests directed to current user to approve/decline
-  const pendingForMe = state.permissions.filter(
-    p => p.targetUserId === currentUser.id && p.status === 'PENDING'
-  );
-
-  // My submitted requests
-  const myRequests = state.permissions.filter(p => p.requesterId === currentUser.id);
-
-  res.json({
-    pendingForMe,
-    myRequests,
-    all: state.permissions,
-  });
+  try {
+    const result = await getRuntimePool().query(
+      `SELECT cr.external_id AS id, requester.legacy_id AS "requesterId", requester.display_name AS "requesterName", target.legacy_id AS "targetUserId", target.display_name AS "targetUserName", cr.target_type AS "actionType", cr.external_target_id AS "entityId", cr.reason, cr.status, cr.created_at AS "createdAt", cr.responded_at AS "respondedAt", cr.applied_at AS "appliedAt", cr.old_value AS "oldValue", cr.proposed_value AS "proposedValue"
+       FROM change_requests cr JOIN participants requester ON requester.id=cr.requester_participant_id JOIN participants target ON target.id=cr.target_participant_id
+       WHERE requester.legacy_id=$1 OR target.legacy_id=$1 ORDER BY cr.created_at DESC`, [currentUser.id]
+    );
+    const requests = result.rows.map((row: any) => ({ ...row, entityTitle: row.entityId || row.actionType }));
+    return res.json({ pendingForMe: requests.filter((request: any) => request.targetUserId === currentUser.id && request.status === 'PENDING'), myRequests: requests.filter((request: any) => request.requesterId === currentUser.id), all: requests });
+  } catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
 });
 
 apiRouter.post('/permissions/:id/approve', async (req, res) => {
@@ -2406,10 +2458,11 @@ apiRouter.get('/audit-logs', async (req, res) => {
 // ----------------------------------------------------------------------
 // 11. ANALYTICS (Section 36)
 // ----------------------------------------------------------------------
-apiRouter.get('/analytics', (req, res) => {
+apiRouter.get('/analytics', async (req, res) => {
   const currentUser = requireAuthUser(req, res);
   if (!currentUser) return;
 
+  await store.refreshFromDatabase();
   const state = store.getState();
   const dayInfo = calculateDayInfo();
 

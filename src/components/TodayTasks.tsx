@@ -8,6 +8,8 @@ interface TodayTasksProps {
   dsaProblem: DSAProblem | null;
   sectionStatuses: Record<ScheduleSection, ScheduleSectionStatus>;
   windowStatus: LearningWindowStatus;
+  isReversalBlocked?: boolean;
+  reversalCooldownText?: string;
   isOnLeaveToday?: boolean;
   isNightLockdown?: boolean;
   onOpenLeavesModal?: () => void;

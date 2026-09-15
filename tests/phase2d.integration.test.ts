@@ -3,15 +3,16 @@ import assert from 'node:assert/strict';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import { Pool } from 'pg';
+import crypto from 'node:crypto';
 
-const databaseUrl = process.env.PHASE2D_DATABASE_URL || process.env.DATABASE_URL;
-const integrationTest = databaseUrl ? test : (name: string, _options: any, _fn: any) => test(name, { skip: 'Set PHASE2D_DATABASE_URL to run real PostgreSQL integration tests.' }, async () => {});
+const databaseUrl = process.env.PHASE2D_DATABASE_URL;
+const integrationTest = databaseUrl ? test : (name: string, _options: any, _fn: any) => test(name, { skip: 'Set PHASE2D_DATABASE_URL to an isolated PostgreSQL test database; DATABASE_URL is intentionally not used.' }, async () => {});
 
 if (databaseUrl) {
   process.env.DATABASE_URL = databaseUrl;
 }
 
-const { apiRouter } = databaseUrl ? await import('../server/routes.ts') : { apiRouter: null };
+const { apiRouter, store } = databaseUrl ? await import('../server/store.ts').then(async (storeModule) => ({ ...(await import('../server/routes.ts')), store: storeModule.store })) : { apiRouter: null, store: null };
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl }) : null;
 const sectionTaskId = 'phase2d-http-task';
 const sections = ['DSA', 'JAVA', 'OS', 'DBMS'] as const;
@@ -28,7 +29,12 @@ function createHttpApp() {
 
 async function request(path: string, userId: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
-  headers.set('Cookie', `session_user_id=${userId}`);
+  const token = `phase2d-${userId}`;
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  await query(`INSERT INTO auth_sessions (session_token_hash, participant_id, expires_at)
+    SELECT $1, id, now() + interval '1 hour' FROM participants WHERE legacy_id=$2
+    ON CONFLICT (session_token_hash) DO UPDATE SET revoked_at=NULL, expires_at=EXCLUDED.expires_at`, [tokenHash, userId]);
+  headers.set('Cookie', `session_token=${token}`);
   return fetch(`${baseUrl}${path}`, { ...init, headers });
 }
 
@@ -99,6 +105,7 @@ async function counts(userId: string, section = 'DSA') {
 }
 
 integrationTest('Phase 2D real PostgreSQL task route matrix', { concurrency: false }, async (t: any) => {
+  await store!.initialize();
   await seedTask();
   const app = createHttpApp();
   server = app.listen(0);
@@ -199,6 +206,7 @@ integrationTest('Phase 2D real PostgreSQL task route matrix', { concurrency: fal
       month: '2-digit',
       day: '2-digit',
     }).format(new Date());
+    await query('DELETE FROM daily_settlements WHERE settlement_date = $1', [settlementDate]);
     const first = await runMidnightSettlement(settlementDate);
     const second = await runMidnightSettlement(settlementDate);
     assert.equal(first.success, true);

@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
 import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './server/routes';
-import { store } from './server/store';
+import { getRuntimePool, store } from './server/store';
 import { runMidnightSettlement, settleMorningCheckinsForDate } from './server/settlementEngine';
 import { getISTNow, getISTDateString, TIMEZONE } from './server/timeUtils';
 
@@ -33,13 +33,24 @@ async function startServer() {
   app.use(cookieParser());
 
   // Health check
-  app.get('/api/health', (req, res) => {
-    res.json({
-      status: 'ok',
-      service: 'Great Coders',
-      currentIST: getISTNow().toISOString(),
-      timezone: TIMEZONE,
-    });
+  app.get('/api/health', async (_req, res) => {
+    try {
+      await getRuntimePool().query('SELECT 1');
+      res.json({
+        status: 'ok',
+        database: 'ok',
+        service: 'Great Coders',
+        currentIST: getISTNow().toISOString(),
+        timezone: TIMEZONE,
+      });
+    } catch (error) {
+      res.status(503).json({
+        status: 'degraded',
+        database: 'unavailable',
+        service: 'Great Coders',
+        error: process.env.NODE_ENV === 'production' ? 'Database unavailable.' : error instanceof Error ? error.message : String(error),
+      });
+    }
   });
 
   // API routes mounted FIRST
@@ -62,9 +73,11 @@ async function startServer() {
 
       // Trigger at 00:00 or 00:01 IST if not yet settled for today
       if (hour === 0 && minute <= 5 && lastSettledDate !== currentDate) {
-        console.log(`[Midnight Scheduler] Triggering automatic 00:00 IST settlement for ${currentDate}...`);
-        lastSettledDate = currentDate;
-        runMidnightSettlement(currentDate);
+        const previousDate = getISTDateString(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+        console.log(`[Midnight Scheduler] Triggering automatic 00:00 IST settlement for ${previousDate}...`);
+        void runMidnightSettlement(previousDate)
+          .then(() => { lastSettledDate = currentDate; })
+          .catch((error) => console.error('[Midnight Scheduler] Settlement failed:', error));
       }
 
       if (hour === 5 && minute <= 5 && lastMorningMissedDate !== currentDate) {

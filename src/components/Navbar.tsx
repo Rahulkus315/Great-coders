@@ -7,6 +7,7 @@ import {
   ShieldCheck,
   Check,
   ChevronDown,
+  Lock,
   Sparkles,
   AlertCircle,
   X,

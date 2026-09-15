@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import { Pool } from 'pg';
+import crypto from 'node:crypto';
 
 const databaseUrl = process.env.PHASE2E_DATABASE_URL;
-const integrationTest = databaseUrl ? test : (name: string, _options: any, _fn: any) => test(name, { skip: 'Set PHASE2E_DATABASE_URL to run real PostgreSQL integration tests.' }, async () => {});
+const integrationTest = databaseUrl ? test : (name: string, _options: any, _fn: any) => test(name, { skip: 'Set PHASE2E_DATABASE_URL to an isolated PostgreSQL test database; DATABASE_URL is intentionally not used.' }, async () => {});
 if (databaseUrl) process.env.DATABASE_URL = databaseUrl;
-const { apiRouter } = databaseUrl ? await import('../server/routes.ts') : { apiRouter: null };
+const { apiRouter, store } = databaseUrl ? await import('../server/store.ts').then(async (storeModule) => ({ ...(await import('../server/routes.ts')), store: storeModule.store })) : { apiRouter: null, store: null };
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl }) : null;
 const RealDate = globalThis.Date;
 let server: ReturnType<express.Application['listen']> | null = null;
@@ -33,7 +34,12 @@ async function query<T = any>(sql: string, values: unknown[] = []) {
 
 async function request(path: string, userId: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
-  headers.set('Cookie', `session_user_id=${userId}`);
+  const token = `phase2e-${userId}`;
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  await query(`INSERT INTO auth_sessions (session_token_hash, participant_id, expires_at)
+    SELECT $1, id, now() + interval '1 hour' FROM participants WHERE legacy_id=$2
+    ON CONFLICT (session_token_hash) DO UPDATE SET revoked_at=NULL, expires_at=EXCLUDED.expires_at`, [tokenHash, userId]);
+  headers.set('Cookie', `session_token=${token}`);
   return fetch(`${baseUrl}${path}`, { ...init, headers });
 }
 
@@ -57,6 +63,7 @@ async function ledgerRows(userId: string, date: string) {
 }
 
 integrationTest('Phase 2E real PostgreSQL wake-up check-in matrix', { concurrency: false }, async (t: any) => {
+  await store!.initialize();
   const app = express();
   app.use(express.json());
   app.use(cookieParser());

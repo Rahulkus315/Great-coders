@@ -82,6 +82,7 @@ export interface DailyTask {
   resources: ResourceLink[];
   interviewQuestions: InterviewQuestion[];
   studyTopics?: StudyTopic[];
+  subtopics?: string[];
 }
 
 export type TaskCompletionStatus = 'PENDING' | 'COMPLETED_ON_TIME' | 'COMPLETED_LATE' | 'MISSED' | 'REVERSED';

@@ -10,6 +10,10 @@ const subjects: Array<[SubjectCode, string]> = [
   ['DBMS', 'DBMS'],
 ];
 
+if (process.env.NODE_ENV === 'production') {
+  throw new Error('Refusing JSON import while NODE_ENV=production. Use an explicitly reviewed migration process against a non-production database.');
+}
+
 const db = process.env.DATABASE_URL || 'postgres://localhost/great_coders_migration_dev';
 const challengeStart = '2026-09-15';
 const challengeEnd = '2026-12-31';

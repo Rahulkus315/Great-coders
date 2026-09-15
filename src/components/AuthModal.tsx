@@ -10,7 +10,7 @@ interface AuthModalProps {
 export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onLoginSuccess }) => {
   const [authMode, setAuthMode] = useState<'GOOGLE' | 'EMAIL'>('GOOGLE');
   const [email, setEmail] = useState('rahulkushwha181@gmail.com');
-  const [password, setPassword] = useState('password123');
+  const [password, setPassword] = useState('rahul@316');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingBinding, setPendingBinding] = useState<null | {
@@ -276,7 +276,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onLoginSuccess }) 
                 placeholder="••••••••"
                 className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
-              <p className="text-[10px] text-slate-500 mt-1">Default test credential: password123</p>
+              <p className="text-[10px] text-slate-500 mt-1">Default test credential: rahul@316 / DileepK@011</p>
             </div>
 
             <button

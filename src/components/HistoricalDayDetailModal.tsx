@@ -325,13 +325,13 @@ export const HistoricalDayDetailModal: React.FC<HistoricalDayDetailModalProps> =
                       <p>{data.task.learningObjective}</p>
                     </div>
 
-                    {data.task.subtopics && data.task.subtopics.length > 0 && (
+                    {(data.task.subtopics ?? data.task.studyTopics?.map((topic) => topic.title) ?? []).length > 0 && (
                       <div className="pt-2">
                         <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-2">
                           Core Topics Covered:
                         </span>
                         <div className="flex flex-wrap gap-1.5">
-                          {data.task.subtopics.map((st, i) => (
+                          {(data.task.subtopics ?? data.task.studyTopics?.map((topic) => topic.title) ?? []).map((st, i) => (
                             <span
                               key={i}
                               className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-xs text-slate-300"

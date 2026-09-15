@@ -85,7 +85,7 @@ export function checkPermissionCooldown(
   return { isBlocked: false, remainingMs: 0, remainingText: '' };
 }
 
-export function createPermissionRequest(
+export async function createPermissionRequest(
   requesterId: string,
   actionType: PermissionActionType,
   entityId: string,
@@ -96,7 +96,7 @@ export function createPermissionRequest(
     oldValue?: string;
     proposedValue?: string;
   }
-): PermissionRequest {
+): Promise<PermissionRequest> {
   const cooldown = checkPermissionCooldown(requesterId, actionType, entityId);
   if (cooldown.isBlocked) {
     throw new PermissionValidationError(`Action is blocked by 12-hour mutual cooldown. ${cooldown.remainingText}`, 429);
@@ -158,32 +158,15 @@ export function createPermissionRequest(
     createdAt: nowIso,
   };
 
-  state.permissions.unshift(request);
+  // Business state is authoritative in PostgreSQL only. Compatibility runtime_state
+  // snapshots are refreshed from the database, not mutated during request creation.
 
-  // Send notification to target partner
-  state.notifications.unshift({
-    id: `notif-perm-${Date.now()}`,
-    userId: targetUser.id,
-    type: 'APPROVAL_REQUEST',
-    title: `Approval Requested by ${requester.name}`,
-    message: `${requester.name} requested approval to ${actionType.toLowerCase().replace('_', ' ')}: "${entityTitle}". Reason: ${reason}`,
-    read: false,
-    createdAt: nowIso,
-  });
-
-  // Add audit log
-  state.auditLogs.unshift({
-    id: `audit-${Date.now()}`,
-    actorId: requester.id,
-    actorName: requester.name,
-    action: `REQUEST_${actionType}`,
-    targetType: actionType,
-    targetId: entityId,
-    reason,
-    timestamp: nowIso,
-  });
-
-  store.save();
+  await getRuntimePool().query(
+    `INSERT INTO change_requests (id, external_id, requester_participant_id, target_participant_id, target_type, external_target_id, old_value, proposed_value, reason, status, created_at)
+     SELECT gen_random_uuid(), $1, requester.id, target.id, $2, $3, $4::jsonb, $5::jsonb, $6, 'PENDING', $7
+     FROM participants requester, participants target WHERE requester.legacy_id=$8 AND target.legacy_id=$9`,
+    [request.id, request.actionType, request.entityId, JSON.stringify(request.oldValue || null), JSON.stringify(request.proposedValue || null), request.reason, nowIso, requester.id, targetUser.id]
+  );
   return request;
 }
 
@@ -223,7 +206,6 @@ export async function handlePermissionResponse(
       req.status = 'EXPIRED';
       req.respondedAt = nowIso;
       req.processedAt = nowIso;
-      store.save();
       throw new PermissionValidationError('This task has changed since the request was created. The request is stale and cannot be approved.', 409);
     }
 
@@ -231,7 +213,6 @@ export async function handlePermissionResponse(
       req.status = 'EXPIRED';
       req.respondedAt = nowIso;
       req.processedAt = nowIso;
-      store.save();
       throw new PermissionValidationError('This task is no longer editable because its execution window has started.', 409);
     }
 
@@ -245,32 +226,15 @@ export async function handlePermissionResponse(
     try {
       await executeApprovedAction(req);
       req.appliedAt = req.appliedAt || nowIso;
-
-      state.notifications.unshift({
-        id: `notif-resp-${Date.now()}`,
-        userId: req.requesterId,
-        type: 'APPROVAL_RESPONSE',
-        title: 'Approval Granted',
-        message: `${responder?.name || 'Partner'} approved your request: "${req.entityTitle}". Action executed.`,
-        read: false,
-        createdAt: nowIso,
-      });
-
-      state.auditLogs.unshift({
-        id: `audit-${Date.now()}`,
-        actorId: responderId,
-        actorName: responder?.name || 'Rahul',
-        action: `APPROVE_${req.actionType}`,
-        targetType: req.actionType,
-        targetId: req.entityId,
-        reason: responseReason || 'Approved by mutual consent',
-        timestamp: nowIso,
-      });
     } catch (error) {
       if (targetSnapshot && target) {
-        Object.assign(target, targetSnapshot);
+        for (const key of Object.keys(targetSnapshot) as Array<keyof typeof targetSnapshot>) {
+          (target as any)[key] = (targetSnapshot as any)[key];
+        }
       }
-      Object.assign(req, reqSnapshot);
+      for (const key of Object.keys(reqSnapshot) as Array<keyof typeof reqSnapshot>) {
+        (req as any)[key] = (reqSnapshot as any)[key];
+      }
       throw error;
     }
   } else {
@@ -279,35 +243,17 @@ export async function handlePermissionResponse(
     req.processedAt = nowIso;
     const cooldownUntil = new Date(now.getTime() + COOLDOWN_MS).toISOString();
     req.declinedCooldownUntil = cooldownUntil;
-
-    state.notifications.unshift({
-      id: `notif-resp-${Date.now()}`,
-      userId: req.requesterId,
-      type: 'APPROVAL_RESPONSE',
-      title: 'Request Declined',
-      message: `${responder?.name || 'Partner'} declined your request: "${req.entityTitle}". 12-hour cooldown active.`,
-      read: false,
-      createdAt: nowIso,
-    });
-
-    state.auditLogs.unshift({
-      id: `audit-${Date.now()}`,
-      actorId: responderId,
-      actorName: responder?.name || 'Rahul',
-      action: `DECLINE_${req.actionType}`,
-      targetType: req.actionType,
-      targetId: req.entityId,
-      reason: responseReason || 'Declined. 12-hour cooldown applied.',
-      timestamp: nowIso,
-    });
   }
 
-  store.save();
+  await getRuntimePool().query(
+    `UPDATE change_requests SET status=$2, responded_at=$3, applied_at=$4, reason=COALESCE(reason, $5) WHERE external_id=$1`,
+    [req.id, req.status, req.respondedAt || null, req.appliedAt || null, responseReason || null]
+  );
   return req;
 }
 
 async function executeApprovedAction(req: PermissionRequest) {
-  const state = store.getState();
+  const pool = getRuntimePool();
   const nowIso = getISTNow().toISOString();
 
   if (req.actionType === 'SCHEDULE_CHANGE') {
@@ -319,53 +265,80 @@ async function executeApprovedAction(req: PermissionRequest) {
     }
 
     const targetEntityType = req.entityType || 'TASK';
-    const activeTarget = targetEntityType === 'DSA'
-      ? state.dsaProblems.find(item => item.id === req.entityId)
-      : state.tasks.find(item => item.id === req.entityId);
+    const targetChallengeDay = await pool.query(
+      `SELECT id, curriculum_day_number, calendar_date::text AS date
+       FROM challenge_days
+       WHERE curriculum_day_number = $1
+       ORDER BY calendar_date ASC
+       LIMIT 1
+       FOR UPDATE`,
+      [proposedDayNumber]
+    );
 
-    if (!activeTarget) {
-      throw new PermissionValidationError('Target schedule item no longer exists.', 404);
+    if (!targetChallengeDay.rowCount) {
+      throw new PermissionValidationError('Requested day is not available in the challenge schedule.', 404);
     }
 
-    const currentVersion = (activeTarget as any).version ?? 1;
-    if (typeof req.targetVersion === 'number' && req.targetVersion !== currentVersion) {
-      throw new PermissionValidationError('This task has changed since the request was created. The request is stale.', 409);
+    const targetDayId = targetChallengeDay.rows[0].id as string;
+    const targetDayDate = targetChallengeDay.rows[0].date as string;
+    const targetDayNumber = Number(targetChallengeDay.rows[0].curriculum_day_number);
+
+    if (targetEntityType === 'DSA') {
+      const result = await pool.query(
+        `UPDATE dsa_problems
+         SET challenge_day_id = $1
+         WHERE legacy_id = $2
+         RETURNING id, legacy_id, challenge_day_id`,
+        [targetDayId, req.entityId]
+      );
+
+      if (!result.rowCount) {
+        throw new PermissionValidationError('Target DSA item no longer exists.', 404);
+      }
+
+      await pool.query(
+        `INSERT INTO audit_logs (actor_participant_id, action, entity_type, entity_id, reason, created_at)
+         VALUES ((SELECT id FROM participants WHERE legacy_id = $1), 'APPLY_SCHEDULE_CHANGE', 'DSA_PROBLEM', $2, $3, $4)`,
+        [req.requesterId, result.rows[0].id, req.reason, nowIso]
+      );
+    } else {
+      const result = await pool.query(
+        `UPDATE curriculum_tasks
+         SET challenge_day_id = $1
+         WHERE legacy_id LIKE $2
+         RETURNING id, legacy_id, challenge_day_id`,
+        [`${targetDayId}`, `${req.entityId}-%`]
+      );
+
+      if (!result.rowCount) {
+        throw new PermissionValidationError('Target task no longer exists.', 404);
+      }
+
+      await pool.query(
+        `INSERT INTO audit_logs (actor_participant_id, action, entity_type, entity_id, reason, created_at)
+         VALUES ((SELECT id FROM participants WHERE legacy_id = $1), 'APPLY_SCHEDULE_CHANGE', 'CURRICULUM_TASK', $2, $3, $4)`,
+        [req.requesterId, result.rows[0].id, req.reason, nowIso]
+      );
     }
 
-    if (activeTarget.dayNumber <= calculateDayInfo().dayNumber) {
-      throw new PermissionValidationError('This task is no longer editable because its execution window has started.', 409);
-    }
-
-    const previousDay = activeTarget.dayNumber;
-    const previousDate = activeTarget.date;
-
-    activeTarget.dayNumber = proposedDayNumber;
-    activeTarget.date = getDateForDay(proposedDayNumber);
-    (activeTarget as any).version = (activeTarget as any).version ? (activeTarget as any).version + 1 : 2;
-
-    req.oldValue = req.oldValue || `Day ${previousDay}`;
+    req.oldValue = req.oldValue || `Day ${targetDayNumber}`;
     req.proposedValue = req.proposedValue || `Day ${proposedDayNumber}`;
     req.appliedAt = nowIso;
     req.processedAt = nowIso;
 
-    state.auditLogs.unshift({
-      id: `audit-schedule-${Date.now()}`,
-      actorId: req.requesterId,
-      actorName: req.requesterName,
-      action: 'APPLY_SCHEDULE_CHANGE',
-      targetType: 'FUTURE_SCHEDULE',
-      targetId: req.entityId,
-      previousState: { dayNumber: previousDay, date: previousDate },
-      newState: { dayNumber: proposedDayNumber, date: getDateForDay(proposedDayNumber), version: (activeTarget as any).version },
-      reason: req.reason,
-      timestamp: nowIso,
-    });
+    if (req.oldValue.startsWith('Day ')) {
+      req.oldValue = req.oldValue.replace(/^Day\s+/, 'Day ');
+    }
+    if (req.proposedValue.startsWith('Day ')) {
+      req.proposedValue = req.proposedValue.replace(/^Day\s+/, 'Day ');
+    }
+
     return;
   }
 
   if (req.actionType === 'TASK_REVERSAL') {
     try {
-      await undoTask(getRuntimePool(), req.requesterId, req.entityId);
+      await undoTask(pool, req.requesterId, req.entityId);
     } catch (error) {
       if (error instanceof TaskCompletionError) {
         throw new PermissionValidationError(error.message, error.statusCode);
@@ -373,41 +346,55 @@ async function executeApprovedAction(req: PermissionRequest) {
       throw error;
     }
   } else if (req.actionType === 'RETROACTIVE_COMPLETION') {
-    let status = state.taskStatuses.find(
-      ts => ts.userId === req.requesterId && ts.taskId === req.entityId
+    const participant = await pool.query(
+      `SELECT id FROM participants WHERE legacy_id = $1 AND status = 'ACTIVE' FOR UPDATE`,
+      [req.requesterId]
     );
-    const task = state.tasks.find(t => t.id === req.entityId);
 
-    if (!status) {
-      status = {
-        taskId: req.entityId,
-        userId: req.requesterId,
-        status: 'COMPLETED_LATE',
-        completedAt: nowIso,
-        pointsAwarded: 2,
-      };
-      state.taskStatuses.push(status);
-    } else {
-      status.status = 'COMPLETED_LATE';
-      status.completedAt = nowIso;
-      status.pointsAwarded = 2;
+    if (!participant.rowCount) {
+      throw new PermissionValidationError('Authenticated participant is not present in PostgreSQL.', 404);
     }
 
-    const userEntries = state.pointLedger.filter(e => e.userId === req.requesterId);
-    const currentRunning = userEntries.reduce((sum, e) => sum + e.points, 0);
+    const taskRow = await pool.query(
+      `SELECT ct.id, ct.challenge_id, ct.challenge_day_id, ct.legacy_id, cd.calendar_date::text AS date
+       FROM curriculum_tasks ct
+       JOIN challenge_days cd ON cd.id = ct.challenge_day_id
+       WHERE ct.legacy_id LIKE $1
+       ORDER BY ct.created_at ASC
+       LIMIT 1
+       FOR UPDATE`,
+      [`${req.entityId}-%`]
+    );
 
-    state.pointLedger.push({
-      id: `ledger-retro-${Date.now()}`,
-      userId: req.requesterId,
-      date: task?.date || req.createdAt.split('T')[0],
-      timestamp: nowIso,
-      eventType: 'MUTUAL_APPROVAL_ADJUSTMENT',
-      points: 2,
-      runningTotal: currentRunning + 2,
-      sourceTaskId: req.entityId,
-      sourceTaskTitle: req.entityTitle,
-      reason: `Retroactive late completion approved by ${req.targetUserName}: ${req.reason}`,
-      category: 'ADMIN',
-    });
+    if (!taskRow.rowCount) {
+      throw new PermissionValidationError('Target task no longer exists in PostgreSQL.', 404);
+    }
+
+    const task = taskRow.rows[0];
+
+    await pool.query(
+      `INSERT INTO points_ledger
+         (participant_id, challenge_id, challenge_day_id, curriculum_task_id, amount, event_type, reason, metadata, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'MUTUAL_APPROVAL_ADJUSTMENT', $6, $7::jsonb, $8)`,
+      [
+        participant.rows[0].id,
+        task.challenge_id,
+        task.challenge_day_id,
+        task.id,
+        2,
+        `Retroactive late completion approved by ${req.targetUserName}: ${req.reason}`,
+        JSON.stringify({ sourceTaskId: req.entityId, sourceTaskTitle: req.entityTitle, category: 'ADMIN' }),
+        nowIso,
+      ]
+    );
+
+    await pool.query(
+      `INSERT INTO audit_logs (actor_participant_id, action, entity_type, entity_id, reason, created_at)
+       VALUES ((SELECT id FROM participants WHERE legacy_id = $1), 'APPLY_RETROACTIVE_COMPLETION', 'CURRICULUM_TASK', $2, $3, $4)`,
+      [req.requesterId, task.id, req.reason, nowIso]
+    );
+
+    req.appliedAt = nowIso;
+    req.processedAt = nowIso;
   }
 }
