@@ -22,6 +22,7 @@ interface JournalViewProps {
   initialView?: 'MY_JOURNAL' | 'PARTNER_JOURNAL';
   onSaveJournal: (journal: Partial<DailyJournal>) => Promise<void>;
   onRatePartner?: (rating: number) => Promise<void>;
+  onRequestReset?: (reason: string) => Promise<void>;
 }
 
 export const JournalView: React.FC<JournalViewProps> = ({
@@ -33,6 +34,7 @@ export const JournalView: React.FC<JournalViewProps> = ({
   initialView = 'MY_JOURNAL',
   onSaveJournal,
   onRatePartner,
+  onRequestReset,
 }) => {
   const [activeView, setActiveView] = useState<'MY_JOURNAL' | 'PARTNER_JOURNAL'>(initialView);
 
@@ -51,13 +53,19 @@ export const JournalView: React.FC<JournalViewProps> = ({
 
   const [isSaved, setIsSaved] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const isFocusedExecutionLocked = Boolean(initialJournal.focusedExecutionFinalizedAt || initialJournal.focusedExecutionMinutes !== undefined);
+  const isFocusedExecutionLocked = Boolean(
+    initialJournal.status !== 'OPEN' ||
+    initialJournal.focusedExecutionFinalizedAt ||
+    initialJournal.focusedExecutionMinutes !== undefined,
+  );
 
   // Peer rating state
   const [hoverRating, setHoverRating] = useState<number>(0);
   const [selectedRating, setSelectedRating] = useState<number>(partnerJournal?.peerReviewRating || 0);
   const [ratingSubmitting, setRatingSubmitting] = useState(false);
   const [ratingSuccessMessage, setRatingSuccessMessage] = useState<string | null>(null);
+  const [resetReason, setResetReason] = useState('');
+  const [resetSubmitting, setResetSubmitting] = useState(false);
 
   useEffect(() => {
     setActiveView(initialView);
@@ -197,6 +205,38 @@ export const JournalView: React.FC<JournalViewProps> = ({
 
       {activeView === 'MY_JOURNAL' ? (
         <form onSubmit={handleSubmit} className="space-y-6">
+          {isFocusedExecutionLocked && onRequestReset && (
+            <div className="rounded-2xl border border-amber-500/30 bg-amber-500/5 p-4 space-y-3">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-[0.16em] text-amber-300">Entry locked</p>
+                <p className="mt-1 text-xs text-slate-300">Ask your partner to approve an edit request before this daily entry can be reopened.</p>
+              </div>
+              <textarea
+                rows={2}
+                value={resetReason}
+                onChange={event => setResetReason(event.target.value)}
+                placeholder="Explain why this entry needs to be edited..."
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:border-amber-400 focus:outline-none"
+              />
+              <button
+                type="button"
+                disabled={resetSubmitting || resetReason.trim().length < 5}
+                onClick={async () => {
+                  setResetSubmitting(true);
+                  try {
+                    await onRequestReset(resetReason.trim());
+                    setResetReason('');
+                  } finally {
+                    setResetSubmitting(false);
+                  }
+                }}
+                className="rounded-xl border border-amber-400/40 bg-amber-500/15 px-4 py-2 text-xs font-bold text-amber-200 transition hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {resetSubmitting ? 'Sending request...' : 'Request partner approval'}
+              </button>
+            </div>
+          )}
+          <fieldset disabled={isFocusedExecutionLocked} className="space-y-6 disabled:opacity-80">
           {/* Peer Review Rating Received Banner */}
           {initialJournal.peerReviewRating && (
             <div className="p-4 bg-gradient-to-r from-amber-500/10 via-purple-500/10 to-indigo-500/10 border border-amber-500/30 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-md">
@@ -372,6 +412,7 @@ export const JournalView: React.FC<JournalViewProps> = ({
               />
             </div>
           </div>
+          </fieldset>
         </form>
       ) : (
         /* PARTNER'S JOURNAL VIEW (STRICTLY READ-ONLY + 1-5 STAR RATING ONLY) */

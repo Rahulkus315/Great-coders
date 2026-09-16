@@ -69,6 +69,40 @@ export async function runMidnightSettlement(targetDateStr?: string) {
          VALUES ($1, $2, 'SELF_CONTROL', $3, $4, $5)`,
         [participant.id, action, entry.rows[0].id, `Self-control day finalized as ${status}.`, nowIso]
       );
+
+      if (status === 'NO_REPORT') {
+        await client.query(
+          `INSERT INTO points_ledger
+             (participant_id, challenge_id, challenge_day_id, amount, event_type, reason, metadata, created_at)
+           VALUES ($1, $2, $3, 1, 'SELF_CONTROL_COMPLETED', 'Self-control maintained for the challenge day (+1 pt)', $4::jsonb, $5)`,
+          [participant.id, challengeDay.rows[0].challenge_id, challengeDay.rows[0].id, JSON.stringify({ date: dateToSettle }), nowIso]
+        );
+      }
+
+      const scheduledSections = await client.query(
+        `SELECT ct.id, ct.subject_id, s.code AS section
+         FROM curriculum_tasks ct
+         JOIN subjects s ON s.id = ct.subject_id
+         WHERE ct.challenge_day_id = $1`,
+        [challengeDay.rows[0].id]
+      );
+      const penalties: Record<string, number> = { DSA: -5, JAVA: -2, DBMS: -2, OS: -1 };
+      for (const scheduled of scheduledSections.rows) {
+        const completion = await client.query(
+          `SELECT 1 FROM task_completions
+           WHERE participant_id = $1 AND curriculum_task_id = $2
+             AND status IN ('COMPLETED_ON_TIME', 'COMPLETED_LATE')`,
+          [participant.id, scheduled.id]
+        );
+        if (!completion.rowCount && penalties[scheduled.section] !== undefined) {
+          await client.query(
+            `INSERT INTO points_ledger
+               (participant_id, challenge_id, challenge_day_id, curriculum_task_id, amount, event_type, reason, metadata, created_at)
+             VALUES ($1, $2, $3, $4, $5, 'TASK_MISSED_PENALTY', $6, $7::jsonb, $8)`,
+            [participant.id, challengeDay.rows[0].challenge_id, challengeDay.rows[0].id, scheduled.id, penalties[scheduled.section], `${scheduled.section} task missed (${penalties[scheduled.section]} pts)`, JSON.stringify({ section: scheduled.section, date: dateToSettle }), nowIso]
+          );
+        }
+      }
     }
 
     const totals = await client.query(

@@ -8,16 +8,16 @@ test('finalizeFocusedExecution stores the first successful value and rejects lat
   const journal: any = {
     id: 'journal-1',
     userId: 'user-rahul',
-    date: '2026-09-15',
+    date: '2026-09-17',
     focusedExecutionMinutes: undefined,
     focusedExecutionFinalizedAt: undefined,
   };
 
-  const first = finalizeFocusedExecution(journal, 300, '2026-09-15T17:02:14+05:30');
+  const first = finalizeFocusedExecution(journal, 300, '2026-09-17T17:02:14+05:30');
   assert.equal(first.ok, true);
   assert.equal(journal.focusedExecutionMinutes, 300);
 
-  const second = finalizeFocusedExecution(journal, 420, '2026-09-15T18:00:00+05:30');
+  const second = finalizeFocusedExecution(journal, 420, '2026-09-17T18:00:00+05:30');
   assert.equal(second.ok, false);
   assert.equal(second.code, 409);
   assert.equal(journal.focusedExecutionMinutes, 300);

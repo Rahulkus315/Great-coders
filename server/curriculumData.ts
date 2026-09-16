@@ -1,11 +1,11 @@
 import { DailyTask, DSAProblem, InterviewQuestion, MotivationQuote, StudyTopic } from '../src/types';
 
-export const CHALLENGE_START_DATE = '2026-09-15';
-export const CHALLENGE_END_DATE = '2026-12-31';
+export const CHALLENGE_START_DATE = '2026-09-17';
+export const CHALLENGE_END_DATE = '2026-12-25';
 export const TOTAL_CHALLENGE_DAYS = 100;
 
 export function getDateForDay(dayNumber: number): string {
-  const start = new Date(2026, 8, 15);
+  const start = new Date(2026, 8, 17);
   const target = new Date(start.getTime() + (dayNumber - 1) * 24 * 60 * 60 * 1000);
   return `${target.getFullYear()}-${String(target.getMonth() + 1).padStart(2, '0')}-${String(target.getDate()).padStart(2, '0')}`;
 }

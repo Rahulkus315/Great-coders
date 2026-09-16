@@ -29,6 +29,20 @@ export const ApprovalsView: React.FC<ApprovalsViewProps> = ({
   onDecline,
 }) => {
   const [responseReason, setResponseReason] = useState<{ [id: string]: string }>({});
+  const [processingId, setProcessingId] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const processRequest = async (id: string, action: () => Promise<void>) => {
+    setProcessingId(id);
+    setErrorMessage(null);
+    try {
+      await action();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to process approval request.');
+    } finally {
+      setProcessingId(null);
+    }
+  };
 
   const formatRemainingTime = (cooldownUntilStr?: string) => {
     if (!cooldownUntilStr) return '';
@@ -55,6 +69,8 @@ export const ApprovalsView: React.FC<ApprovalsViewProps> = ({
           </div>
         </div>
       </div>
+
+      {errorMessage && <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs font-semibold text-rose-300">{errorMessage}</div>}
 
       {/* 1. Pending Approvals Awaiting YOUR Decision */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
@@ -106,14 +122,16 @@ export const ApprovalsView: React.FC<ApprovalsViewProps> = ({
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => onDecline(req.id, responseReason[req.id])}
+                      disabled={processingId !== null}
+                      onClick={() => void processRequest(req.id, () => onDecline(req.id, responseReason[req.id]))}
                       className="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/30 transition-colors cursor-pointer flex items-center gap-1.5"
                     >
                       <XCircle className="w-3.5 h-3.5 text-rose-400" /> Decline (12h Cooldown)
                     </button>
                     <button
                       type="button"
-                      onClick={() => onApprove(req.id, responseReason[req.id])}
+                      disabled={processingId !== null}
+                      onClick={() => void processRequest(req.id, () => onApprove(req.id, responseReason[req.id]))}
                       className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition-all shadow-md cursor-pointer flex items-center gap-1.5"
                     >
                       <CheckCircle className="w-3.5 h-3.5" /> Approve & Execute

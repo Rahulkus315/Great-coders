@@ -22,6 +22,16 @@ import {
 } from 'lucide-react';
 import { DailyTask, DSAProblem, TaskCompletionStatus } from '../types';
 
+type CompletionSection = 'DSA' | 'JAVA' | 'OS' | 'DBMS';
+
+interface CompletionSectionState {
+  status: 'NONE' | 'PENDING' | 'APPROVED' | 'COMPLETED';
+  requestId?: string | null;
+  pointsAwarded: number;
+  canRequest: boolean;
+  canComplete: boolean;
+}
+
 interface DayHistoryDetail {
   dayNumber: number;
   date: string;
@@ -58,6 +68,7 @@ interface DayHistoryDetail {
     dayPoints: number;
     dayLedger: any[];
   };
+  completionSections?: Partial<Record<CompletionSection, CompletionSectionState>>;
   existingRequest?: any;
   canRequestApproval: boolean;
 }
@@ -87,6 +98,7 @@ export const HistoricalDayDetailModal: React.FC<HistoricalDayDetailModalProps> =
   const [approvalFeedback, setApprovalFeedback] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'OVERVIEW' | 'DSA' | 'JOURNAL' | 'LEDGER'>('OVERVIEW');
   const [expandedInterview, setExpandedInterview] = useState<string | null>(null);
+  const [selectedSection, setSelectedSection] = useState<CompletionSection>('DSA');
 
   useEffect(() => {
     if (!isOpen || dayNumber === null) return;
@@ -130,6 +142,7 @@ export const HistoricalDayDetailModal: React.FC<HistoricalDayDetailModalProps> =
         credentials: 'include',
         body: JSON.stringify({
           reason: requestReason.trim(),
+          section: selectedSection,
         }),
       });
 
@@ -142,6 +155,16 @@ export const HistoricalDayDetailModal: React.FC<HistoricalDayDetailModalProps> =
       if (data) {
         setData({
           ...data,
+          completionSections: {
+            ...data.completionSections,
+            [selectedSection]: {
+              ...data.completionSections?.[selectedSection],
+              status: 'PENDING',
+              requestId: json.request.id,
+              canRequest: false,
+              canComplete: false,
+            },
+          },
           existingRequest: json.request,
           canRequestApproval: false,
         });
@@ -149,6 +172,27 @@ export const HistoricalDayDetailModal: React.FC<HistoricalDayDetailModalProps> =
       if (onApprovalRequested) onApprovalRequested();
     } catch (err: any) {
       alert(err.message || 'Approval request failed.');
+    } finally {
+      setSubmittingApproval(false);
+    }
+  };
+
+  const handleCompleteApprovedSection = async () => {
+    setSubmittingApproval(true);
+    try {
+      const res = await fetch(`/api/tasks/${data?.task.id}/sections/${selectedSection}/complete`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || 'Failed to complete approved section.');
+      const refreshed = await fetch(`/api/day/${dayNumber}`, { credentials: 'include' });
+      if (!refreshed.ok) throw new Error('Completion succeeded, but the day state could not be refreshed.');
+      setData(await refreshed.json());
+      setApprovalFeedback(`Completed ${selectedSection} late for +${json.pointsAwarded} point.`);
+      onApprovalRequested?.();
+    } catch (err: any) {
+      setError(err.message || 'Approved completion failed.');
     } finally {
       setSubmittingApproval(false);
     }
@@ -444,8 +488,21 @@ export const HistoricalDayDetailModal: React.FC<HistoricalDayDetailModalProps> =
                         In accordance with the 100-Day Rules, past dates are permanently immutable.
                         Direct editing is blocked. If you left this task incomplete on Day {dayNumber},
                         you may request your competitor’s approval to retroactively mark it complete as a
-                        Late Submission (+2 points).
+                        Late Submission (+1 point).
                       </p>
+
+                      <div className="flex flex-wrap gap-2">
+                        {(['DSA', 'JAVA', 'OS', 'DBMS'] as CompletionSection[]).map(section => (
+                          <button
+                            key={section}
+                            type="button"
+                            onClick={() => setSelectedSection(section)}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold border ${selectedSection === section ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-900 border-slate-700 text-slate-300'}`}
+                          >
+                            {section}
+                          </button>
+                        ))}
+                      </div>
 
                       {approvalFeedback && (
                         <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-xs font-semibold">
@@ -453,27 +510,35 @@ export const HistoricalDayDetailModal: React.FC<HistoricalDayDetailModalProps> =
                         </div>
                       )}
 
-                      {data.existingRequest ? (
+                      {data.completionSections?.[selectedSection]?.status === 'COMPLETED' ? (
+                        <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs font-medium">
+                          Completed • Late +{data.completionSections[selectedSection]?.pointsAwarded || 1}
+                        </div>
+                      ) : data.completionSections?.[selectedSection]?.status === 'PENDING' ? (
                         <div className="p-3.5 rounded-xl bg-slate-900 border border-slate-800 text-xs space-y-1">
                           <span className="text-amber-400 font-bold block">
-                            ⏳ Approval Request Currently Pending:
+                            Request Pending
                           </span>
-                          <p className="text-slate-300">"{data.existingRequest.reason}"</p>
                           <span className="text-[11px] text-slate-500 block">
                             Waiting for {data.partnerUser.name} to review in their Approvals tab.
                           </span>
                         </div>
-                      ) : data.currentUser.taskStatus === 'COMPLETED_ON_TIME' ||
-                        data.currentUser.taskStatus === 'COMPLETED_LATE' ? (
-                        <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs font-medium">
-                          ✓ Task is already complete for Day {dayNumber}. No approval request needed.
-                        </div>
-                      ) : data.canRequestApproval ? (
+                      ) : data.completionSections?.[selectedSection]?.status === 'APPROVED' ? (
+                        <button
+                          type="button"
+                          onClick={handleCompleteApprovedSection}
+                          disabled={submittingApproval}
+                          className="w-full py-2.5 px-4 rounded-xl text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                        >
+                          <CheckCircle2 className="w-4 h-4" />
+                          {submittingApproval ? 'Completing...' : 'Complete Section'}
+                        </button>
+                      ) : data.completionSections?.[selectedSection]?.status === 'NONE' && data.completionSections?.[selectedSection]?.canRequest ? (
                         <div className="space-y-3 pt-2">
                           <textarea
                             value={requestReason}
                             onChange={e => setRequestReason(e.target.value)}
-                            placeholder="Explain why this task was left incomplete and what you have completed now..."
+                            placeholder="Explain why this section was left incomplete..."
                             rows={3}
                             className="w-full bg-slate-900 border border-slate-700 rounded-xl p-3 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500"
                           />
@@ -483,18 +548,13 @@ export const HistoricalDayDetailModal: React.FC<HistoricalDayDetailModalProps> =
                             disabled={submittingApproval || requestReason.trim().length < 5}
                             className="w-full py-2.5 px-4 rounded-xl text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
                           >
-                            {submittingApproval ? (
-                              <>
-                                <Loader2 className="w-4 h-4 animate-spin" />
-                                <span>Submitting Request...</span>
-                              </>
-                            ) : (
-                              <>
-                                <Send className="w-4 h-4" />
-                                <span>Request Partner Approval (+2 Late Points)</span>
-                              </>
-                            )}
+                            {submittingApproval ? 'Submitting Request...' : 'Request Completion'}
                           </button>
+                        </div>
+                      ) : data.currentUser.taskStatus === 'COMPLETED_ON_TIME' ||
+                        data.currentUser.taskStatus === 'COMPLETED_LATE' ? (
+                        <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs font-medium">
+                          ✓ Task is already complete for Day {dayNumber}. No approval request needed.
                         </div>
                       ) : null}
                     </div>

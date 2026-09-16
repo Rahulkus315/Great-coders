@@ -81,15 +81,15 @@ integrationTest('Phase 2E real PostgreSQL wake-up check-in matrix', { concurrenc
     assert.equal((await request('/api/morning/checkin', 'user-rahul', { method: 'POST' })).status, 400);
     setServerTime('2026-09-14T22:30:00.000Z');
     assert.equal((await request('/api/morning/checkin', 'user-rahul', { method: 'POST' })).status, 200);
-    assert.equal((await checkinRows('user-rahul', '2026-09-15'))[0].points_awarded, 2);
-    assert.equal((await ledgerRows('user-rahul', '2026-09-15')).length, 1);
+    assert.equal((await checkinRows('user-rahul', '2026-09-17'))[0].points_awarded, 2);
+    assert.equal((await ledgerRows('user-rahul', '2026-09-17')).length, 1);
   });
 
   await t.test('04:59:59 remains eligible and 05:00:00 rejects', async () => {
-    setServerTime('2026-09-15T23:29:59.000Z');
+    setServerTime('2026-09-17T23:29:59.000Z');
     assert.equal((await request('/api/morning/checkin', 'user-rahul', { method: 'POST' })).status, 200);
     assert.equal((await request('/api/morning/checkin', 'user-dileep', { method: 'POST' })).status, 200);
-    setServerTime('2026-09-15T23:30:00.000Z');
+    setServerTime('2026-09-17T23:30:00.000Z');
     assert.equal((await request('/api/morning/checkin', 'user-rahul', { method: 'POST' })).status, 400);
   });
 

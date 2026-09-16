@@ -7,12 +7,14 @@ import type { DailyTask, DSAProblem, StudySubject } from '../src/types';
 dotenv.config();
 
 const rawDatabaseUrl = process.env.DATABASE_URL;
+const rahulPasswordHash = process.env.RAHUL_PASSWORD_HASH;
+const dileepPasswordHash = process.env.DILEEP_PASSWORD_HASH;
 const CHALLENGE_NAME = 'Great Coders';
-const CHALLENGE_START = '2026-09-15';
-const CHALLENGE_END = '2026-12-31';
+const CHALLENGE_START = '2026-09-17';
+const CHALLENGE_END = '2026-12-25';
 const TIMEZONE = 'Asia/Kolkata';
 const CURRICULUM_DAYS = 100;
-const TOTAL_CHALLENGE_DAYS = 108;
+const TOTAL_CHALLENGE_DAYS = 100;
 
 const participants = [
   {
@@ -109,6 +111,9 @@ async function main() {
   if (!rawDatabaseUrl) {
     throw new Error('DATABASE_URL is required.');
   }
+  if (!rahulPasswordHash || !dileepPasswordHash) {
+    throw new Error('RAHUL_PASSWORD_HASH and DILEEP_PASSWORD_HASH are required.');
+  }
 
   const curriculum = generateCurriculum();
   if (curriculum.tasks.length !== CURRICULUM_DAYS || curriculum.dsaProblems.length !== CURRICULUM_DAYS) {
@@ -160,11 +165,12 @@ async function main() {
 
     const participantIds = new Map<string, string>();
     for (const participant of participants) {
+      const passwordHash = participant.legacyId === 'user-rahul' ? rahulPasswordHash : dileepPasswordHash;
       const result = await client.query(
-        `INSERT INTO participants (legacy_id, display_name, email, avatar_url, target_role, status)
-         VALUES ($1, $2, $3, $4, $5, 'ACTIVE')
+        `INSERT INTO participants (legacy_id, display_name, email, avatar_url, target_role, password_hash, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'ACTIVE')
          RETURNING id`,
-        [participant.legacyId, participant.displayName, participant.email, participant.avatarUrl, participant.targetRole]
+        [participant.legacyId, participant.displayName, participant.email, participant.avatarUrl, participant.targetRole, passwordHash]
       );
       const participantId = result.rows[0].id as string;
       participantIds.set(participant.legacyId, participantId);

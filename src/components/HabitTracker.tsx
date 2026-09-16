@@ -15,6 +15,7 @@ import { ConfirmationModal } from './ConfirmationModal';
 interface HabitTrackerProps {
   myStats: HabitStats;
   partnerStreak: number;
+  partnerBestStreak: number;
   partnerCleanDays: number;
   partnerName: string;
   comparisonText: string;
@@ -28,6 +29,7 @@ interface HabitTrackerProps {
 export const HabitTracker: React.FC<HabitTrackerProps> = ({
   myStats,
   partnerStreak,
+  partnerBestStreak,
   partnerCleanDays,
   partnerName,
   comparisonText,
@@ -72,7 +74,7 @@ export const HabitTracker: React.FC<HabitTrackerProps> = ({
               {currentUserName === 'Rahul' ? myStats.currentStreak : partnerStreak} Days
             </div>
             <span className="text-[11px] text-slate-500 block mt-1">
-              Best: {currentUserName === 'Rahul' ? myStats.bestStreak : Math.max(partnerStreak, 18)} Days
+              Best: {currentUserName === 'Rahul' ? myStats.bestStreak : partnerBestStreak} Days
             </span>
           </div>
 
@@ -85,7 +87,7 @@ export const HabitTracker: React.FC<HabitTrackerProps> = ({
               {currentUserName === 'Dileep' ? myStats.currentStreak : partnerStreak} Days
             </div>
             <span className="text-[11px] text-slate-500 block mt-1">
-              Best: {currentUserName === 'Dileep' ? myStats.bestStreak : Math.max(partnerStreak, 14)} Days
+              Best: {currentUserName === 'Dileep' ? myStats.bestStreak : partnerBestStreak} Days
             </span>
           </div>
         </div>

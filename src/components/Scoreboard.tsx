@@ -11,12 +11,14 @@ import {
   Percent,
   Coins,
 } from 'lucide-react';
-import { UserStats, DayInfo, MotivationQuote } from '../types';
+import { DayInfo, MotivationQuote, ProfileSettings, UserStats } from '../types';
 
 interface ScoreboardProps {
   dayInfo: DayInfo;
   rahul: UserStats;
   dileep: UserStats;
+  rahulProfile?: ProfileSettings | null;
+  dileepProfile?: ProfileSettings | null;
   pointDifferenceText: string;
   dailyQuote: MotivationQuote;
   currentUserId: string;
@@ -26,6 +28,8 @@ export const Scoreboard: React.FC<ScoreboardProps> = ({
   dayInfo,
   rahul,
   dileep,
+  rahulProfile,
+  dileepProfile,
   pointDifferenceText,
   dailyQuote,
   currentUserId,
@@ -96,7 +100,7 @@ export const Scoreboard: React.FC<ScoreboardProps> = ({
 
             <div className="flex items-center gap-4">
               <img
-                src="https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80"
+                src={rahulProfile?.avatarUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80'}
                 alt="Rahul"
                 className="w-14 h-14 rounded-xl object-cover ring-2 ring-indigo-500/40"
               />
@@ -178,7 +182,7 @@ export const Scoreboard: React.FC<ScoreboardProps> = ({
 
             <div className="flex items-center gap-4">
               <img
-                src="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80"
+                src={dileepProfile?.avatarUrl || 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80'}
                 alt="Dileep"
                 className="w-14 h-14 rounded-xl object-cover ring-2 ring-emerald-500/40"
               />

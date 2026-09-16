@@ -25,7 +25,7 @@
     {
       "id": "task-day-1",
       "dayNumber": 1,
-      "date": "2026-09-15",
+      "date": "2026-09-17",
       "category": "DSA",
       "title": "DAY 1 - DSA + Java + OS + DBMS",
       "description": "Complete the four coordinated tracks. DSA focus: Arrays basics - traversal, prefix sums (3 easy).",
@@ -5456,7 +5456,7 @@
     {
       "id": "task-day-100",
       "dayNumber": 100,
-      "date": "2026-12-23",
+      "date": "2026-12-25",
       "category": "DSA",
       "title": "DAY 100 - DSA + Java + OS + DBMS",
       "description": "Complete the four coordinated tracks. DSA focus: Final weak-area DSA revision.",
@@ -5513,7 +5513,7 @@
     {
       "id": "dsa-day-1",
       "dayNumber": 1,
-      "date": "2026-09-15",
+      "date": "2026-09-17",
       "title": "Arrays basics - traversal, prefix sums (3 easy)",
       "category": "Arrays basics",
       "difficulty": "EASY",
@@ -7352,7 +7352,7 @@
     {
       "id": "dsa-day-100",
       "dayNumber": 100,
-      "date": "2026-12-23",
+      "date": "2026-12-25",
       "title": "Final weak-area DSA revision",
       "category": "Final weak-area DSA revision",
       "difficulty": "MEDIUM",
@@ -9386,8 +9386,8 @@
       "id": "notif-welcome-rahul",
       "userId": "user-rahul",
       "type": "COMPETITION_ALERT",
-      "title": "🎯 108-Day Crucible Commenced",
-      "message": "Welcome Rahul! Challenge runs from Sep 15 to Dec 31, 2026. Wake up and check in between 04:00 AM - 05:00 AM IST to earn +2 discipline points daily.",
+      "title": "🎯 Great Coders Challenge Started",
+      "message": "Welcome Rahul! Your Great Coders journey begins today. Keep your daily streak strong and stay focused on execution.",
       "read": true,
       "createdAt": "2026-09-13T00:57:55.503Z"
     },
@@ -9395,8 +9395,8 @@
       "id": "notif-welcome-dileep",
       "userId": "user-dileep",
       "type": "COMPETITION_ALERT",
-      "title": "🎯 108-Day Crucible Commenced",
-      "message": "Welcome Dileep! Challenge runs from Sep 15 to Dec 31, 2026. Maintain your daily discipline and outwork yesterday.",
+      "title": "🎯 Great Coders Challenge Started",
+      "message": "Welcome Dileep! Your Great Coders journey begins today. Keep your daily streak strong and stay focused on execution.",
       "read": true,
       "createdAt": "2026-09-13T00:57:55.503Z"
     }
@@ -10083,9 +10083,9 @@
       "actorName": "SYSTEM",
       "action": "INITIALIZE_CHALLENGE",
       "targetType": "CHALLENGE",
-      "targetId": "108_DAY_CHALLENGE",
-      "reason": "Initialized production 108-day curriculum for Rahul and Dileep (Sep 15 - Dec 31, 2026)",
-      "timestamp": "2026-09-15T00:00:00+05:30"
+      "targetId": "100_DAY_CHALLENGE",
+      "reason": "Initialized 100-day DSA + Java + OS + DBMS curriculum for Rahul and Dileep (Sep 17 - Dec 25, 2026)",
+      "timestamp": "2026-09-17T00:00:00+05:30"
     }
   ],
   "frozenDays": [],

@@ -24,15 +24,17 @@ interface RoadmapViewProps {
   totalDays?: number;
   subjectPoints?: Partial<Record<ScheduleSection, number>>;
   pendingScheduleRequests?: PermissionRequest[];
+  currentUserId: string;
   onSelectDay: (dayNumber: number) => void;
   onCompleteSection: (taskId: string, section: ScheduleSection) => Promise<void>;
+  onRequestCompletion: (taskId: string, section: ScheduleSection) => Promise<void>;
 }
 
 const SUBJECTS: Array<{ id: ScheduleSection; label: string; icon: React.ReactNode; points: number }> = [
-  { id: 'DSA', label: 'DSA', icon: <Code2 className="w-5 h-5" />, points: 10 },
-  { id: 'JAVA', label: 'Java', icon: <Coffee className="w-5 h-5" />, points: 10 },
-  { id: 'OS', label: 'Operating Systems', icon: <Server className="w-5 h-5" />, points: 8 },
-  { id: 'DBMS', label: 'DBMS', icon: <Database className="w-5 h-5" />, points: 8 },
+  { id: 'DSA', label: 'DSA', icon: <Code2 className="w-5 h-5" />, points: 3 },
+  { id: 'JAVA', label: 'Java', icon: <Coffee className="w-5 h-5" />, points: 2 },
+  { id: 'OS', label: 'Operating Systems', icon: <Server className="w-5 h-5" />, points: 1 },
+  { id: 'DBMS', label: 'DBMS', icon: <Database className="w-5 h-5" />, points: 1 },
 ];
 
 const completed = (status?: ScheduleSectionStatus) =>
@@ -43,13 +45,19 @@ export const RoadmapView: React.FC<RoadmapViewProps> = ({
   currentDayNumber,
   totalDays = 100,
   subjectPoints = {},
+  pendingScheduleRequests = [],
+  currentUserId,
   onSelectDay,
   onCompleteSection,
+  onRequestCompletion,
 }) => {
   const [selectedSubject, setSelectedSubject] = useState<ScheduleSection>('DSA');
   const [completing, setCompleting] = useState<string | null>(null);
+  const [requesting, setRequesting] = useState<string | null>(null);
+  const [requestError, setRequestError] = useState<string | null>(null);
+  const [requestErrorKey, setRequestErrorKey] = useState<string | null>(null);
   const subject = SUBJECTS.find(item => item.id === selectedSubject)!;
-  const elapsedTasks = tasks.filter(task => task.dayNumber <= currentDayNumber);
+  const elapsedTasks = tasks.filter(task => !task.isLocked);
   const subjectTasks = tasks.filter(task => task.sectionStatuses?.[selectedSubject]);
   const completedDays = elapsedTasks.filter(task => completed(task.sectionStatuses[selectedSubject])).length;
 
@@ -76,6 +84,21 @@ export const RoadmapView: React.FC<RoadmapViewProps> = ({
       await onCompleteSection(task.id, selectedSubject);
     } finally {
       setCompleting(null);
+    }
+  };
+
+  const handleRequest = async (task: RoadmapTask) => {
+    const key = `${task.id}-${selectedSubject}`;
+    setRequesting(key);
+    setRequestError(null);
+    setRequestErrorKey(null);
+    try {
+      await onRequestCompletion(task.id, selectedSubject);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : 'Failed to request late completion.');
+      setRequestErrorKey(key);
+    } finally {
+      setRequesting(null);
     }
   };
 
@@ -140,7 +163,13 @@ export const RoadmapView: React.FC<RoadmapViewProps> = ({
           {subjectTasks.map(task => {
             const status = task.sectionStatuses[selectedSubject];
             const isDone = completed(status);
-            const isFuture = task.dayNumber > currentDayNumber;
+            const isLateDone = status?.status === 'COMPLETED_LATE';
+            const isFuture = task.isLocked;
+            const requestId = `${task.id}::${selectedSubject}`;
+            const request = pendingScheduleRequests?.find(item => item.entityId === requestId && item.requesterId === currentUserId);
+            const isPending = request?.status === 'PENDING';
+            const isApproved = request?.status === 'APPROVED';
+            const isDeclined = request?.status === 'DECLINED' || request?.status === 'EXPIRED';
             const topic = getTopic(task);
             const key = `${task.id}-${selectedSubject}`;
             return (
@@ -169,10 +198,10 @@ export const RoadmapView: React.FC<RoadmapViewProps> = ({
                 </div>
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-800">
                   {isDone ? (
-                    <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-300"><CheckCircle2 className="w-4 h-4" /> Completed (+{status.pointsAwarded} pts)</span>
+                    <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-300"><CheckCircle2 className="w-4 h-4" /> {isLateDone ? `Completed • Late +${status.pointsAwarded}` : `Completed (+${status.pointsAwarded} pts)`}</span>
                   ) : isFuture ? (
                     <span className="text-xs font-semibold text-slate-500">Available on Day {task.dayNumber}</span>
-                  ) : (
+                  ) : task.isCurrentDay ? (
                     <button
                       type="button"
                       disabled={completing === key}
@@ -181,11 +210,34 @@ export const RoadmapView: React.FC<RoadmapViewProps> = ({
                     >
                       <CheckCircle2 className="w-3.5 h-3.5" /> {completing === key ? 'Completing...' : 'Complete Section'}
                     </button>
+                  ) : isPending ? (
+                    <span className="text-xs font-semibold text-amber-300">Request Pending</span>
+                  ) : isApproved ? (
+                    <button
+                      type="button"
+                      disabled={completing === key}
+                      onClick={() => handleComplete(task)}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold disabled:opacity-60"
+                    >
+                      <CheckCircle2 className="w-3.5 h-3.5" /> {completing === key ? 'Completing...' : 'Approved — Complete Task'}
+                    </button>
+                  ) : isDeclined ? (
+                    <span className="text-xs font-semibold text-rose-300">Request Rejected / Locked</span>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={requesting === key}
+                      onClick={() => void handleRequest(task)}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold disabled:opacity-60"
+                    >
+                      <CheckCircle2 className="w-3.5 h-3.5" /> {requesting === key ? 'Requesting...' : 'Request Completion'}
+                    </button>
                   )}
                   <button type="button" onClick={() => onSelectDay(task.dayNumber)} className="inline-flex items-center gap-1 text-xs font-bold text-indigo-400 hover:text-indigo-300">
                     Inspect Day <ChevronRight className="w-3.5 h-3.5" />
                   </button>
                 </div>
+                {requestError && requestErrorKey === key && <p className="mt-2 text-xs text-rose-300">{requestError}</p>}
               </article>
             );
           })}

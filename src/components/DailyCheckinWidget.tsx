@@ -11,7 +11,7 @@ import {
   AlertCircle,
   TrendingUp,
 } from 'lucide-react';
-import { User, DailyCheckinRecord } from '../types';
+import { User, DailyCheckinRecord, ProfileSettings } from '../types';
 import { CheckinResult } from './CheckinSuccessModal';
 
 interface DailyCheckinWidgetProps {
@@ -28,6 +28,8 @@ interface DailyCheckinWidgetProps {
   };
   currentUser: User;
   partnerUser: User;
+  currentProfile: ProfileSettings;
+  partnerProfile: ProfileSettings;
   onCheckinSuccess: (result: CheckinResult) => void;
   isNightLockdown?: boolean;
 }
@@ -36,6 +38,8 @@ export const DailyCheckinWidget: React.FC<DailyCheckinWidgetProps> = ({
   checkinInfo,
   currentUser,
   partnerUser,
+  currentProfile,
+  partnerProfile,
   onCheckinSuccess,
   isNightLockdown = false,
 }) => {
@@ -46,8 +50,6 @@ export const DailyCheckinWidget: React.FC<DailyCheckinWidgetProps> = ({
   const partnerCheckedIn = !!checkinInfo?.partnerHasCheckedInToday;
   const myStreak = checkinInfo?.myStreak ?? 0;
   const partnerStreak = checkinInfo?.partnerStreak ?? 0;
-  const daysUntilBonus = checkinInfo?.daysUntilBonus ?? 7;
-  const dayInCycle = myStreak > 0 ? (myStreak % 7 === 0 ? 7 : myStreak % 7) : 0;
 
   const handleCheckin = async () => {
     if (loading || hasCheckedIn) return;
@@ -106,50 +108,29 @@ export const DailyCheckinWidget: React.FC<DailyCheckinWidgetProps> = ({
               <h3 className="text-base sm:text-lg font-bold text-slate-100 flex items-center gap-2">
                 Daily Check-In & Streak Radar
                 <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                  +1 Coin / Day
+                  +1 Point / Day
                 </span>
               </h3>
               <p className="text-xs text-slate-400">
-                Check in every day to earn +1 coin. Maintain 7 continuous days for{' '}
-                <span className="text-amber-400 font-semibold">+5 extra points</span>.
+                Check in once during the server-controlled daily window to earn +1 point.
               </p>
             </div>
           </div>
         </div>
 
-        {/* 7-Day Bonus Cycle Progress Indicator */}
+        {/* Daily point status */}
         <div className="bg-slate-950/80 border border-slate-800 rounded-xl px-3 sm:px-4 py-2.5 flex flex-wrap sm:flex-nowrap items-center gap-2 sm:gap-3 self-stretch sm:self-start md:self-auto">
           <div className="flex items-center gap-1.5">
             <Trophy className="w-4 h-4 text-amber-400" />
-            <span className="text-xs font-semibold text-slate-300">7-Day Bonus:</span>
+            <span className="text-xs font-semibold text-slate-300">Daily reward:</span>
           </div>
 
           <div className="flex items-center gap-1">
-            {[1, 2, 3, 4, 5, 6, 7].map(step => {
-              const filled = step <= dayInCycle;
-              const isReward = step === 7;
-              return (
-                <div
-                  key={step}
-                  title={isReward ? 'Day 7: +5 Bonus Points' : `Day ${step}`}
-                  className={`w-6 h-6 rounded-md flex items-center justify-center text-[10px] font-bold transition-all ${
-                    filled
-                      ? 'bg-amber-500 text-slate-950 shadow-sm shadow-amber-500/30'
-                      : isReward
-                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse'
-                      : 'bg-slate-800 text-slate-500 border border-slate-700/50'
-                  }`}
-                >
-                  {isReward ? '🎁' : step}
-                </div>
-              );
-            })}
+            <div className="w-8 h-8 rounded-md flex items-center justify-center text-xs font-bold bg-amber-500 text-slate-950">+1</div>
           </div>
 
           <span className="text-[11px] font-medium text-amber-400 whitespace-nowrap">
-            {hasCheckedIn && dayInCycle === 7
-              ? 'Bonus awarded!'
-              : `${daysUntilBonus}d left to +5`}
+            {hasCheckedIn ? 'Awarded today' : 'Available once today'}
           </span>
         </div>
       </div>
@@ -176,7 +157,7 @@ export const DailyCheckinWidget: React.FC<DailyCheckinWidgetProps> = ({
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-center gap-3">
               <img
-                src={currentUser.avatar}
+                src={currentProfile.avatarUrl || currentUser.avatar}
                 alt={currentUser.name}
                 className="w-11 h-11 rounded-xl object-cover ring-2 ring-indigo-500/40"
               />
@@ -265,7 +246,7 @@ export const DailyCheckinWidget: React.FC<DailyCheckinWidgetProps> = ({
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-center gap-3">
               <img
-                src={partnerUser.avatar}
+                src={partnerProfile.avatarUrl || partnerUser.avatar}
                 alt={partnerUser.name}
                 className="w-11 h-11 rounded-xl object-cover ring-2 ring-emerald-500/30"
               />

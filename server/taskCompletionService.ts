@@ -1,14 +1,16 @@
 import { Pool, PoolClient } from 'pg';
 import { calculateDayInfo, getISTNow } from './timeUtils';
+import { ensureParticipantSchedule } from './participantScheduleService';
 
 export type TaskSection = 'DSA' | 'JAVA' | 'OS' | 'DBMS';
 
 const SECTION_POINTS: Record<TaskSection, number> = {
-  DSA: 10,
-  JAVA: 10,
-  OS: 8,
-  DBMS: 8,
+  DSA: 3,
+  JAVA: 2,
+  OS: 1,
+  DBMS: 1,
 };
+const LATE_POINTS = 1;
 
 export class TaskCompletionError extends Error {
   constructor(public readonly statusCode: number, message: string) {
@@ -76,12 +78,40 @@ async function resolveTask(client: PoolClient, taskId: string, section: TaskSect
   return result.rows[0] as TaskRow;
 }
 
-function validateTaskDate(task: TaskRow) {
+async function validateTaskDate(client: PoolClient, participantId: string, task: TaskRow) {
   const currentDate = calculateDayInfo().currentDate;
-  if (task.calendar_date > currentDate) {
+  await ensureParticipantSchedule(client, participantId, task.challenge_id);
+  const schedule = await client.query(
+    `SELECT effective_date::text AS date
+     FROM participant_schedule_days
+     WHERE participant_id = $1 AND challenge_id = $2 AND curriculum_day_number = (
+       SELECT curriculum_day_number FROM challenge_days WHERE id = $3
+     )`,
+    [participantId, task.challenge_id, task.challenge_day_id],
+  );
+  const effectiveDate = schedule.rows[0]?.date as string | undefined;
+  if (!effectiveDate) throw new TaskCompletionError(409, 'Participant schedule is not available for this task.');
+  if (effectiveDate > currentDate) {
     throw new TaskCompletionError(403, 'Future curriculum sections cannot be completed early.');
   }
-  return task.calendar_date === currentDate;
+  return effectiveDate === currentDate;
+}
+
+async function consumeApprovedLateRequest(client: PoolClient, participantId: string, taskId: string, section: TaskSection, task: TaskRow) {
+  const request = await client.query(
+    `SELECT cr.id
+     FROM change_requests cr
+     WHERE cr.requester_participant_id = $1
+       AND cr.target_type = 'RETROACTIVE_COMPLETION'
+       AND cr.target_id = $2
+       AND cr.status = 'APPROVED'
+     FOR UPDATE`,
+    [participantId, task.id],
+  );
+  if (!request.rowCount) {
+    throw new TaskCompletionError(403, 'Past curriculum sections require partner approval before late completion.');
+  }
+  return request.rows[0].id as string;
 }
 
 async function currentTotal(client: PoolClient, participantId: string) {
@@ -121,8 +151,10 @@ export async function completeTaskSection(
 
     const participantId = await resolveParticipant(client, legacyUserId);
     const task = await resolveTask(client, taskId, section);
-    const isToday = validateTaskDate(task);
-    const points = isToday ? SECTION_POINTS[section] : Math.floor(SECTION_POINTS[section] / 2);
+    const isToday = await validateTaskDate(client, participantId, task);
+    const approvedRequestId = isToday ? null : await consumeApprovedLateRequest(client, participantId, taskId, section, task);
+    const points = SECTION_POINTS[section];
+    const awardedPoints = isToday ? points : LATE_POINTS;
     const status = isToday ? 'COMPLETED_ON_TIME' : 'COMPLETED_LATE';
     const nowIso = getISTNow().toISOString();
 
@@ -154,7 +186,7 @@ export async function completeTaskSection(
                      points_awarded = EXCLUDED.points_awarded,
                      completed_at = EXCLUDED.completed_at,
                      version = task_completions.version + 1`,
-      [participantId, task.id, task.subject_id, status, points, nowIso]
+      [participantId, task.id, task.subject_id, status, awardedPoints, nowIso]
     );
 
     await client.query(
@@ -166,18 +198,24 @@ export async function completeTaskSection(
         task.challenge_id,
         task.challenge_day_id,
         task.id,
-        points,
+        awardedPoints,
         status === 'COMPLETED_ON_TIME' ? 'TASK_COMPLETED_ON_TIME' : 'TASK_COMPLETED_LATE',
-        `${section} section completed for '${task.title}' (+${points} pts)`,
+        `${section} section completed for '${task.title}' (+${awardedPoints} pts)`,
         JSON.stringify({ section, sourceTaskId: taskId, sourceTaskTitle: task.title, category: task.category }),
         nowIso,
       ]
     );
 
     await writeAudit(client, participantId, task, 'MARK_SCHEDULE_SECTION_COMPLETE', `${section} section completed.`, nowIso);
+    if (approvedRequestId) {
+      await client.query(
+        `UPDATE change_requests SET status = 'APPLIED', applied_at = $2 WHERE id = $1 AND status = 'APPROVED'`,
+        [approvedRequestId, nowIso],
+      );
+    }
     const newTotal = (await currentTotal(client, participantId));
     await client.query('COMMIT');
-    return { section, status, pointsAwarded: points, newTotal };
+    return { section, status, pointsAwarded: awardedPoints, newTotal };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
@@ -200,7 +238,7 @@ export async function undoTaskSection(
 
     const participantId = await resolveParticipant(client, legacyUserId);
     const task = await resolveTask(client, taskId, section);
-    const isToday = validateTaskDate(task);
+    const isToday = await validateTaskDate(client, participantId, task);
     if (!isToday) {
       throw new TaskCompletionError(403, 'Only the current challenge-day section can be undone.');
     }

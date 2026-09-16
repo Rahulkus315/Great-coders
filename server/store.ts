@@ -1,4 +1,3 @@
-import bcrypt from 'bcryptjs';
 import fs from 'node:fs';
 import { Pool } from 'pg';
 import {
@@ -18,10 +17,10 @@ import {
   MorningCheckin,
   LeaveDay,
   DailyCheckinRecord,
-  AuthenticationIdentity,
   ScheduleSectionStatus,
 } from '../src/types';
 import { generateCurriculum, MOTIVATION_QUOTES } from './curriculumData';
+import { ensureParticipantSchedules } from './participantScheduleService';
 
 let runtimePool: Pool | null = null;
 
@@ -90,13 +89,9 @@ export interface AppState {
   leaves: LeaveDay[];
   notifications: AppNotification[];
   auditLogs: AuditLogEntry[];
-  authIdentities: AuthenticationIdentity[];
   frozenDays: string[]; // Dates that have completed midnight settlement
   simulatedDate: string | null;
 }
-
-const RAHUL_PASSWORD_HASH = bcrypt.hashSync('rahul@316', 10);
-const DILEEP_PASSWORD_HASH = bcrypt.hashSync('DileepK@011', 10);
 
 class Store {
   private state: AppState;
@@ -124,6 +119,44 @@ class Store {
               updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
           `);
+          await pool.query(`
+            CREATE TABLE IF NOT EXISTS participant_schedule_days (
+              participant_id UUID NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+              challenge_id UUID NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+              curriculum_day_number INTEGER NOT NULL,
+              effective_date DATE NOT NULL,
+              source_challenge_day_id UUID NOT NULL REFERENCES challenge_days(id),
+              challenge_day_id UUID REFERENCES challenge_days(id),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              PRIMARY KEY (participant_id, challenge_id, curriculum_day_number)
+            )
+          `);
+          await pool.query(`ALTER TABLE participant_schedule_days ADD COLUMN IF NOT EXISTS effective_date DATE`);
+          await pool.query(`ALTER TABLE participant_schedule_days ADD COLUMN IF NOT EXISTS source_challenge_day_id UUID`);
+          await pool.query(`ALTER TABLE participant_schedule_days ADD COLUMN IF NOT EXISTS challenge_day_id UUID`);
+          await pool.query(`
+            UPDATE participant_schedule_days psd
+            SET effective_date = COALESCE(psd.effective_date, cd.calendar_date),
+              source_challenge_day_id = COALESCE(psd.source_challenge_day_id, psd.challenge_day_id),
+              challenge_day_id = COALESCE(psd.challenge_day_id, psd.source_challenge_day_id)
+            FROM challenge_days cd
+            WHERE cd.id = COALESCE(psd.source_challenge_day_id, psd.challenge_day_id)
+          `);
+          await pool.query(`ALTER TABLE participant_schedule_days ALTER COLUMN effective_date SET NOT NULL`);
+          await pool.query(`ALTER TABLE participant_schedule_days ALTER COLUMN source_challenge_day_id SET NOT NULL`);
+          await pool.query(`
+            CREATE TABLE IF NOT EXISTS challenge_participants (
+              challenge_id UUID NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+              participant_id UUID NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+              joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              PRIMARY KEY (challenge_id, participant_id)
+            )
+          `);
+          await pool.query(`
+            INSERT INTO challenge_participants (challenge_id, participant_id)
+            SELECT c.id, p.id FROM challenges c JOIN participants p ON p.legacy_id IN ('user-rahul', 'user-dileep') AND p.status = 'ACTIVE'
+            WHERE c.name = 'Great Coders' ON CONFLICT DO NOTHING
+          `);
 
           const result = await pool.query(
             'SELECT state_json FROM runtime_state WHERE name = $1 LIMIT 1',
@@ -136,6 +169,18 @@ class Store {
           }
 
           await this.hydrateNormalizedState(pool);
+          const challenges = await pool.query(`SELECT id FROM challenges`);
+          const client = await pool.connect();
+          try {
+            await client.query('BEGIN');
+            for (const challenge of challenges.rows) await ensureParticipantSchedules(client, challenge.id);
+            await client.query('COMMIT');
+          } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+          } finally {
+            client.release();
+          }
 
           this.initialized = true;
         } catch (error) {
@@ -197,6 +242,21 @@ class Store {
     if (participants.rowCount) {
       state.users = participants.rows.map((row: any) => ({ ...row, name: row.name as 'Rahul' | 'Dileep' }));
     }
+
+    const scheduledTasks = await pool.query(
+      `SELECT ct.legacy_id, cd.calendar_date::text AS date
+       FROM curriculum_tasks ct JOIN challenge_days cd ON cd.id = ct.challenge_day_id
+       ORDER BY cd.calendar_date ASC`,
+    );
+    const taskDates = new Map<string, string>(scheduledTasks.rows.map((row: any) => [row.legacy_id, row.date]));
+    state.tasks = state.tasks.map(task => ({ ...task, date: taskDates.get(`${task.id}-DSA`) || task.date }));
+
+    const scheduledDsa = await pool.query(
+      `SELECT dp.legacy_id, cd.calendar_date::text AS date
+       FROM dsa_problems dp JOIN challenge_days cd ON cd.id = dp.challenge_day_id`,
+    );
+    const dsaDates = new Map<string, string>(scheduledDsa.rows.map((row: any) => [row.legacy_id, row.date]));
+    state.dsaProblems = state.dsaProblems.map(problem => ({ ...problem, date: dsaDates.get(problem.id) || problem.date }));
 
     const profiles = await pool.query(
       `SELECT p.legacy_id AS id, pr.display_name AS "displayName", pr.headline, pr.bio, pr.skills, pr.cover_theme AS "coverTheme", pr.avatar_url AS "avatarUrl"
@@ -278,18 +338,20 @@ class Store {
     );
     state.auditLogs = audits.rows.map((row: any) => ({ ...row, actorName: row.actorId === 'user-dileep' ? 'Dileep' : row.actorId === 'user-rahul' ? 'Rahul' : 'SYSTEM' }));
 
-    const identities = await pool.query(
-      `SELECT ai.id, ai.provider, ai.provider_subject AS "providerSubject", ai.email, ai.email_verified AS "emailVerified", p.legacy_id AS "participantId", ai.created_at AS "createdAt", ai.last_login_at AS "lastLoginAt"
-       FROM authentication_identities ai JOIN participants p ON p.id=ai.participant_id`
-    );
-    state.authIdentities = identities.rows.map((row: any) => ({ ...row, bindingStatus: 'PERMANENT' }));
-
     const requests = await pool.query(
-      `SELECT cr.external_id AS id, requester.legacy_id AS "requesterId", requester.display_name AS "requesterName", target.legacy_id AS "targetUserId", target.display_name AS "targetUserName", cr.target_type AS "actionType", cr.external_target_id AS "entityId", cr.reason, cr.status, cr.created_at AS "createdAt", cr.responded_at AS "respondedAt", cr.applied_at AS "appliedAt", cr.old_value AS "oldValue", cr.proposed_value AS "proposedValue"
+      `SELECT cr.external_id AS id, requester.legacy_id AS "requesterId", requester.display_name AS "requesterName", target.legacy_id AS "targetUserId", target.display_name AS "targetUserName", cr.target_type AS "actionType", cr.external_target_id AS "entityId", cr.target_id AS "targetRecordId", targetTask.legacy_id AS "targetTaskLegacyId", targetSubject.code AS "targetSection", cr.reason, cr.status, cr.created_at AS "createdAt", cr.responded_at AS "respondedAt", cr.applied_at AS "appliedAt", cr.old_value AS "oldValue", cr.proposed_value AS "proposedValue"
        FROM change_requests cr JOIN participants requester ON requester.id=cr.requester_participant_id JOIN participants target ON target.id=cr.target_participant_id
+       LEFT JOIN curriculum_tasks targetTask ON targetTask.id=cr.target_id
+       LEFT JOIN subjects targetSubject ON targetSubject.id=targetTask.subject_id
        WHERE cr.external_id IS NOT NULL ORDER BY cr.created_at ASC`
     );
-    state.permissions = requests.rows.map((row: any) => ({ ...row, entityTitle: row.entityId || row.actionType }));
+    state.permissions = requests.rows.map((row: any) => ({
+      ...row,
+      entityId: row.actionType === 'RETROACTIVE_COMPLETION' && !String(row.entityId || '').includes('::') && row.targetTaskLegacyId && row.targetSection
+        ? `${String(row.targetTaskLegacyId).replace(/-(DSA|JAVA|OS|DBMS)$/, '')}::${row.targetSection}`
+        : row.entityId,
+      entityTitle: row.entityId || row.actionType,
+    }));
   }
 
   public save() {
@@ -332,7 +394,7 @@ class Store {
         targetRole: 'DSA + Java + OS + DBMS — Interview Ready Engineer',
         boundIdentity: 'identity-lock-rahul-001',
         createdAt: '2026-09-01T00:00:00Z',
-        passwordHash: RAHUL_PASSWORD_HASH,
+        passwordHash: '',
       },
       {
         id: 'user-dileep',
@@ -342,7 +404,7 @@ class Store {
         targetRole: 'DSA + Java + OS + DBMS — Interview Ready Engineer',
         boundIdentity: 'identity-lock-dileep-002',
         createdAt: '2026-09-01T00:00:00Z',
-        passwordHash: DILEEP_PASSWORD_HASH,
+        passwordHash: '',
       },
     ];
 
@@ -355,8 +417,6 @@ class Store {
     const dailyCheckins: DailyCheckinRecord[] = [];
     const leaves: LeaveDay[] = [];
     const frozenDays: string[] = [];
-
-    const authIdentities: AuthenticationIdentity[] = [];
 
     const profiles: Record<string, ParticipantProfile> = {
       'user-rahul': {
@@ -406,8 +466,8 @@ class Store {
         action: 'INITIALIZE_CHALLENGE',
         targetType: 'CHALLENGE',
         targetId: '100_DAY_CHALLENGE',
-        reason: 'Initialized 100-day DSA + Java + OS + DBMS curriculum for Rahul and Dileep (Sep 15 - Dec 31, 2026)',
-        timestamp: '2026-09-15T00:00:00+05:30',
+        reason: 'Initialized 100-day DSA + Java + OS + DBMS curriculum for Rahul and Dileep (Sep 17 - Dec 25, 2026)',
+        timestamp: '2026-09-17T00:00:00+05:30',
       },
     ];
 
@@ -431,7 +491,6 @@ class Store {
       leaves,
       notifications,
       auditLogs,
-      authIdentities,
       frozenDays,
       simulatedDate: null,
     };

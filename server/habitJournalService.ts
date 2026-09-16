@@ -144,13 +144,22 @@ export async function saveJournal(pool: Pool, legacyId: string, date: string, in
   try {
     await client.query('BEGIN');
     const id = await participant(client, legacyId); const day = await challengeDay(client, date); const nowIso = getISTNow().toISOString();
-    const status = input.status === 'LOCKED' ? 'LOCKED' : input.status === 'SUBMITTED' ? 'SUBMITTED' : 'OPEN';
+    const existing = await client.query(
+      `SELECT status, focused_execution_finalized
+       FROM todays_live WHERE participant_id = $1 AND challenge_day_id = $2 FOR UPDATE`,
+      [id, day.id]
+    );
+    if (existing.rowCount && (existing.rows[0].status !== 'OPEN' || existing.rows[0].focused_execution_finalized)) {
+      throw new HabitJournalError(409, 'Today\'s entry is locked. Request partner approval before editing it.');
+    }
+    const status = 'LOCKED';
+    const focusedMinutes = Number(input.focusedExecutionMinutes ?? Math.round((Number(input.studyHours) || 0) * 60));
     const result = await client.query(
       `INSERT INTO todays_live (participant_id, challenge_day_id, summary, what_i_learned, what_i_built, what_i_struggled_with, mistakes, mistakes_lessons, tomorrow_focus, additional_notes, study_hours, focused_execution_minutes, focused_execution_finalized, focused_execution_finalized_at, status, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)
-       ON CONFLICT (participant_id, challenge_day_id) DO UPDATE SET summary=EXCLUDED.summary, what_i_learned=EXCLUDED.what_i_learned, what_i_built=EXCLUDED.what_i_built, what_i_struggled_with=EXCLUDED.what_i_struggled_with, mistakes=EXCLUDED.mistakes, mistakes_lessons=EXCLUDED.mistakes_lessons, tomorrow_focus=EXCLUDED.tomorrow_focus, additional_notes=EXCLUDED.additional_notes, study_hours=EXCLUDED.study_hours, status=EXCLUDED.status, updated_at=EXCLUDED.updated_at
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true,$13,$14,$15,$15)
+      ON CONFLICT (participant_id, challenge_day_id) DO UPDATE SET summary=EXCLUDED.summary, what_i_learned=EXCLUDED.what_i_learned, what_i_built=EXCLUDED.what_i_built, what_i_struggled_with=EXCLUDED.what_i_struggled_with, mistakes=EXCLUDED.mistakes, mistakes_lessons=EXCLUDED.mistakes_lessons, tomorrow_focus=EXCLUDED.tomorrow_focus, additional_notes=EXCLUDED.additional_notes, study_hours=EXCLUDED.study_hours, focused_execution_minutes=EXCLUDED.focused_execution_minutes, focused_execution_finalized=true, focused_execution_finalized_at=EXCLUDED.focused_execution_finalized_at, status='LOCKED', updated_at=EXCLUDED.updated_at, version=todays_live.version + 1
        RETURNING id`,
-      [id, day.id, input.summary || input.todayRoutine || '', input.whatILearned || '', input.whatIBuilt || '', input.whatIStruggledWith || '', input.mistakes || '', input.mistakesLessons || '', input.tomorrowFocus || input.tomorrowImprovements || '', input.additionalNotes || '', Number(input.studyHours) || 3, input.focusedExecutionMinutes ?? null, false, null, status, nowIso]
+          [id, day.id, input.summary || input.todayRoutine || '', input.whatILearned || '', input.whatIBuilt || '', input.whatIStruggledWith || '', input.mistakes || '', input.mistakesLessons || '', input.tomorrowFocus || input.tomorrowImprovements || '', input.additionalNotes || '', Number(input.studyHours) || 3, focusedMinutes, nowIso, status, nowIso]
     );
     await client.query('COMMIT');
     return { id: result.rows[0].id, userId: legacyId, date: day.date, ...input, status, updatedAt: nowIso };

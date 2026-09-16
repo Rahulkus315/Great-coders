@@ -10,18 +10,15 @@ export interface User {
   createdAt: string;
 }
 
-export type BindingStatus = 'PENDING' | 'PERMANENT';
+export type CoverTheme = 'default' | 'developer' | 'java' | 'ai' | 'backend' | 'fullstack';
 
-export interface AuthenticationIdentity {
-  id: string;
-  provider: 'GOOGLE';
-  providerSubject: string;
-  email: string;
-  emailVerified: boolean;
-  participantId: 'user-rahul' | 'user-dileep';
-  bindingStatus: BindingStatus;
-  createdAt: string;
-  lastLoginAt: string;
+export interface ProfileSettings {
+  displayName: string;
+  headline: string;
+  bio: string;
+  skills: string;
+  coverTheme: CoverTheme;
+  avatarUrl?: string;
 }
 
 export type SubjectCategory =
@@ -138,16 +135,18 @@ export interface DSAAttempt {
 }
 
 export type LedgerEventType =
-  | 'TASK_COMPLETED_ON_TIME' // +4
-  | 'TASK_MISSED_SETTLEMENT' // -5
-  | 'TASK_COMPLETED_LATE' // +2
-  | 'DSA_COMPLETED' // +1..+4
-  | 'DAILY_CHECKIN' // +1 Coin & streak +1
-  | 'CHECKIN_STREAK_7_BONUS' // +5 Extra points for 7-day continuous streak
-  | 'MORNING_CHECKIN_SUCCESS' // +2 (Awake between 04:00 AM - 05:00 AM)
-  | 'MORNING_CHECKIN_MISSED' // -1 (Missed 04:00 AM - 05:00 AM window)
-  | 'LEAVE_HOLIDAY_APPLIED' // 0 (Schedule shifted 1 day forward)
-  | 'TASK_REVERSED' // -4 (or -2)
+  | 'TASK_COMPLETED_ON_TIME'
+  | 'TASK_MISSED_SETTLEMENT'
+  | 'TASK_COMPLETED_LATE'
+  | 'DSA_COMPLETED'
+  | 'DAILY_CHECKIN'
+  | 'CHECKIN_STREAK_7_BONUS'
+  | 'MORNING_CHECKIN_SUCCESS'
+  | 'MORNING_CHECKIN_MISSED'
+  | 'LEAVE_HOLIDAY_APPLIED'
+  | 'TASK_REVERSED'
+  | 'TASK_MISSED_PENALTY'
+  | 'SELF_CONTROL_COMPLETED'
   | 'MUTUAL_APPROVAL_ADJUSTMENT';
 
 export interface DailyCheckinRecord {
@@ -228,8 +227,9 @@ export type PermissionActionType =
   | 'SCORE_ADJUSTMENT'
   | 'SCHEDULE_CHANGE'
   | 'RULE_MODIFICATION'
-  | 'RETROACTIVE_COMPLETION';
-export type PermissionStatus = 'PENDING' | 'APPROVED' | 'DECLINED' | 'EXPIRED';
+  | 'RETROACTIVE_COMPLETION'
+  | 'RESET_ENTRY';
+export type PermissionStatus = 'PENDING' | 'APPROVED' | 'DECLINED' | 'EXPIRED' | 'APPLIED';
 
 export interface PermissionRequest {
   id: string;
@@ -241,6 +241,7 @@ export interface PermissionRequest {
   entityType?: 'TASK' | 'DSA' | 'STUDY_SCHEDULE';
   entityId: string;
   entityTitle: string;
+  targetRecordId?: string;
   targetVersion?: number;
   oldValue?: string;
   proposedValue?: string;
@@ -331,6 +332,7 @@ export interface AuditLogEntry {
   id: string;
   actorId: string;
   actorName: 'Rahul' | 'Dileep' | 'SYSTEM';
+  actorAvatar?: string;
   action: string;
   targetType: string;
   targetId: string;
@@ -356,8 +358,8 @@ export interface DayInfo {
   totalDays: number; // 100
   daysRemaining: number;
   challengeStarted: boolean;
-  challengeStartDate: string; // 2026-09-15
-  challengeEndDate: string; // 2026-12-23
+  challengeStartDate: string; // 2026-09-17
+  challengeEndDate: string; // 2026-12-25
   windowStatus: LearningWindowStatus;
   windowOpensAt: string; // 04:00 AM
   windowClosesSoonAt: string; // 10:00 PM
@@ -445,6 +447,8 @@ export interface AnalyticsResponse {
 export interface DashboardResponse extends CompetitionOverview {
   currentUser: User;
   partnerUser: User;
+  profile: ProfileSettings | null;
+  partnerProfile: ProfileSettings | null;
   rahulStats: UserStats;
   dileepStats: UserStats;
   currentUserStats: UserStats;

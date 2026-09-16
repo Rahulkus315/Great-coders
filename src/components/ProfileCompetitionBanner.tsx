@@ -12,24 +12,7 @@ import {
   User,
   X,
 } from 'lucide-react';
-import { DayInfo, User as AppUser, UserStats } from '../types';
-
-export type CoverTheme =
-  | 'default'
-  | 'developer'
-  | 'java'
-  | 'ai'
-  | 'backend'
-  | 'fullstack';
-
-export interface ProfileSettings {
-  displayName: string;
-  headline: string;
-  bio: string;
-  skills: string;
-  coverTheme: CoverTheme;
-  avatarUrl?: string;
-}
+import { CoverTheme, DayInfo, ProfileSettings, User as AppUser, UserStats } from '../types';
 
 interface ProfileCompetitionBannerProps {
   currentUser: AppUser;
@@ -75,8 +58,8 @@ export const ProfileCompetitionBanner: React.FC<ProfileCompetitionBannerProps> =
   partnerStats,
   dayInfo,
   leaderName,
-  currentProfile,
-  partnerProfile,
+  currentProfile = defaultProfileSettings(currentUser),
+  partnerProfile = defaultProfileSettings(partnerUser),
   canEdit,
   onEditProfile,
 }) => {

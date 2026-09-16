@@ -1,5 +1,6 @@
 import { Pool, PoolClient } from 'pg';
 import { calculateDayInfo, getISTNow } from './timeUtils';
+import { rescheduleParticipantAfterHoliday } from './participantScheduleService';
 
 export class DailyActivityError extends Error {
   constructor(public readonly statusCode: number, message: string) {
@@ -112,8 +113,8 @@ export async function recordDailyCheckin(pool: Pool, legacyId: string) {
     yesterday.setUTCDate(yesterday.getUTCDate() - 1);
     const isConsecutive = previousDate.rowCount && previousDate.rows[0].date === yesterday.toISOString().slice(0, 10);
     const streakDay = isConsecutive ? Number(previous.rows[0].streak_day) + 1 : 1;
-    const bonusPoints = streakDay % 7 === 0 ? 5 : 0;
-    const coinsAwarded = 1 + bonusPoints;
+    const bonusPoints = 0;
+    const coinsAwarded = 1;
     const inserted = await client.query(
       `INSERT INTO daily_checkins (participant_id, challenge_day_id, checkin_date, checked_in_at, time_text, streak_day, coins_awarded, bonus_awarded, bonus_points)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -127,14 +128,6 @@ export async function recordDailyCheckin(pool: Pool, legacyId: string) {
       [user.id, challengeDay.challenge_id, challengeDay.id, `Daily Check-In verified (Streak: Day ${streakDay})`, JSON.stringify({ date: currentDate, streakDay }), nowIso]
     );
     eventTotal += 1;
-    if (bonusPoints) {
-      await client.query(
-        `INSERT INTO points_ledger (participant_id, challenge_id, challenge_day_id, amount, event_type, reason, metadata, created_at)
-         VALUES ($1, $2, $3, $4, 'CHECKIN_STREAK_7_BONUS', $5, $6::jsonb, $7)`,
-        [user.id, challengeDay.challenge_id, challengeDay.id, bonusPoints, '7-Day Continuous Streak Milestone', JSON.stringify({ date: currentDate, streakDay }), nowIso]
-      );
-      eventTotal += bonusPoints;
-    }
     await client.query('COMMIT');
     const history = await dailyHistory(client, user.id);
     return { alreadyCheckedIn: false, checkin: checkinShape(inserted.rows[0]), stats: stats(history, currentDate), pointsTotal: eventTotal };
@@ -184,6 +177,7 @@ export async function applyLeave(pool: Pool, legacyId: string, date: string, rea
        VALUES ($1, $2, $3, $4, 'APPROVED', $5) RETURNING id, reason, created_at AS "appliedAt"`,
       [user.id, challengeDay.challenge_id, challengeDay.id, Number(used.rows[0].count) + 1, reason || 'Personal Rest / Holiday']
     );
+    await rescheduleParticipantAfterHoliday(client, user.id, challengeDay.challenge_id, date);
     await client.query(
       `INSERT INTO self_control_entries (participant_id, challenge_day_id, status, recorded_at)
        VALUES ($1, $2, 'HOLIDAY', $3)

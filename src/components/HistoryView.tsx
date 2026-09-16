@@ -250,11 +250,11 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ logs = [], currentDate
                       <td className="py-3.5 px-4 whitespace-nowrap">
                         {isRahul ? (
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
-                            <User className="w-3 h-3 text-indigo-400" /> Rahul
+                            {log.actorAvatar ? <img src={log.actorAvatar} alt="Rahul" className="w-4 h-4 rounded-full object-cover" /> : <User className="w-3 h-3 text-indigo-400" />} Rahul
                           </span>
                         ) : isDileep ? (
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                            <User className="w-3 h-3 text-amber-400" /> Dileep
+                            {log.actorAvatar ? <img src={log.actorAvatar} alt="Dileep" className="w-4 h-4 rounded-full object-cover" /> : <User className="w-3 h-3 text-amber-400" />} Dileep
                           </span>
                         ) : (
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-slate-800 text-slate-400 border border-slate-700">

@@ -1,21 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Trophy,
-  Calendar,
-  Flame,
-  FileSpreadsheet,
   BookOpen,
-  Code2,
-  BarChart2,
-  ShieldCheck,
-  History,
-  Sparkles,
-  RefreshCw,
-  Clock,
-  Layers,
-  Award,
   Moon,
-  Star,
 } from 'lucide-react';
 import {
   DashboardResponse,
@@ -32,7 +18,7 @@ import {
   User,
 } from './types';
 import { Navbar } from './components/Navbar';
-import { ProfileCompetitionBanner, ProfileEditModal, ProfileSettings, getDefaultProfileSettings } from './components/ProfileCompetitionBanner';
+import { ProfileCompetitionBanner, ProfileEditModal, getDefaultProfileSettings } from './components/ProfileCompetitionBanner';
 import { TodayTasks } from './components/TodayTasks';
 import { RoadmapView } from './components/RoadmapView';
 import { ScoreLedgerView } from './components/ScoreLedgerView';
@@ -52,6 +38,7 @@ import { MorningCheckinCard } from './components/MorningCheckinCard';
 import { LeaveModal } from './components/LeaveModal';
 import { DailyCheckinWidget } from './components/DailyCheckinWidget';
 import { CheckinSuccessModal, CheckinResult } from './components/CheckinSuccessModal';
+import { DashboardSidebar, MobileMenuButton } from './components/DashboardSidebar';
 
 type ActiveTab =
   | 'TODAY'
@@ -63,6 +50,17 @@ type ActiveTab =
   | 'ANALYTICS'
   | 'APPROVALS'
   | 'HISTORY';
+
+const normalizePermissionsData = (data: Partial<{
+  pendingForMe: PermissionRequest[];
+  myRequests: PermissionRequest[];
+  allRequests: PermissionRequest[];
+  all: PermissionRequest[];
+}>) => ({
+  pendingForMe: Array.isArray(data.pendingForMe) ? data.pendingForMe : [],
+  myRequests: Array.isArray(data.myRequests) ? data.myRequests : [],
+  allRequests: Array.isArray(data.allRequests) ? data.allRequests : Array.isArray(data.all) ? data.all : [],
+});
 
 export default function App() {
   const [currentUserId, setCurrentUserId] = useState<string>('');
@@ -77,7 +75,7 @@ export default function App() {
   const [showCheckinModal, setShowCheckinModal] = useState(false);
   const [checkinResult, setCheckinResult] = useState<CheckinResult | null>(null);
   const [showProfileEditor, setShowProfileEditor] = useState(false);
-  const [profileSettings, setProfileSettings] = useState<Record<string, ProfileSettings>>({});
+  const [showSidebar, setShowSidebar] = useState(false);
 
   // Core dashboard state
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null);
@@ -95,6 +93,7 @@ export default function App() {
   const [habitData, setHabitData] = useState<{
     myStats: HabitStats;
     partnerStreak: number;
+    partnerBestStreak: number;
     partnerCleanDays: number;
     partnerName: string;
     comparisonText: string;
@@ -111,19 +110,6 @@ export default function App() {
   }>({ pendingForMe: [], myRequests: [], allRequests: [] });
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [analyticsData, setAnalyticsData] = useState<any>(null);
-
-  const fetchProfileSettings = useCallback(async () => {
-    try {
-      const res = await fetch('/api/profile', { credentials: 'include' });
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data.profile) {
-        setProfileSettings(prev => ({ ...prev, [currentUserId || data.userId]: data.profile }));
-      }
-    } catch (err) {
-      console.error('Error loading profile settings:', err);
-    }
-  }, [currentUserId]);
 
   // Fetch all core application state
   const fetchDashboardData = useCallback(async () => {
@@ -147,6 +133,8 @@ export default function App() {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         setRoadmapData(data);
+        const permissionsRes = await fetch('/api/permissions', { credentials: 'include' });
+        if (permissionsRes.ok) setPermissionsData(normalizePermissionsData(await permissionsRes.json()));
       } else if (tab === 'LEDGER') {
         const res = await fetch('/api/ledger');
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -167,7 +155,7 @@ export default function App() {
         const res = await fetch('/api/permissions', { credentials: 'include' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        setPermissionsData(data);
+        setPermissionsData(normalizePermissionsData(data));
       } else if (tab === 'HISTORY') {
         const res = await fetch('/api/audit-logs');
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -221,8 +209,7 @@ export default function App() {
     if (!sessionChecked || !currentUserId) return;
     fetchDashboardData();
     fetchTabData(activeTab);
-    fetchProfileSettings();
-  }, [sessionChecked, currentUserId, activeTab, fetchDashboardData, fetchTabData, fetchProfileSettings]);
+  }, [sessionChecked, activeTab, fetchDashboardData, fetchTabData]);
 
   // Periodic refresh every 30 seconds for real-time synchronization
   useEffect(() => {
@@ -244,6 +231,22 @@ export default function App() {
     }
     await fetchDashboardData();
     await fetchTabData(activeTab);
+  };
+
+  const handleRequestCompletion = async (taskId: string, section: ScheduleSection) => {
+    const reason = window.prompt(`Why do you need late completion approval for ${section}?`);
+    if (!reason) return;
+    const res = await fetch(`/api/tasks/${taskId}/sections/${section}/request-completion`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Failed to request late completion.');
+    await fetchDashboardData();
+    await fetchTabData('ROADMAP');
+    await fetchTabData('APPROVALS');
   };
 
   const handleCompleteTodayTask = async () => {
@@ -392,51 +395,67 @@ export default function App() {
     }
   };
 
+  const handleRequestJournalReset = async (reason: string) => {
+    const res = await fetch('/api/journal/reset-request', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date: dashboard?.dayInfo.currentDate, reason }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Unable to request entry reset.');
+    await fetchTabData('APPROVALS');
+    await fetchTabData('JOURNAL');
+  };
+
   // Handlers for Approvals
   const handleApproveRequest = async (id: string, responseNotes?: string) => {
-    try {
-      const res = await fetch(`/api/permissions/${id}/approve`, {
+    const res = await fetch(`/api/permissions/${id}/approve`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ responseNotes }),
       });
-      if (res.ok) {
-        await fetchTabData('APPROVALS');
-        await fetchDashboardData();
-      }
-    } catch (err) {
-      console.error('Failed to approve request:', err);
-    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Failed to approve request.');
+    await fetchTabData('APPROVALS');
+    await fetchTabData('ROADMAP');
+    await fetchTabData('JOURNAL');
+    await fetchDashboardData();
   };
 
   const handleDeclineRequest = async (id: string, responseNotes?: string) => {
-    try {
-      const res = await fetch(`/api/permissions/${id}/decline`, {
+    const res = await fetch(`/api/permissions/${id}/decline`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ responseNotes }),
       });
-      if (res.ok) {
-        await fetchTabData('APPROVALS');
-        await fetchDashboardData();
-      }
-    } catch (err) {
-      console.error('Failed to decline request:', err);
-    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Failed to decline request.');
+    await fetchTabData('APPROVALS');
+    await fetchTabData('ROADMAP');
+    await fetchDashboardData();
   };
 
   const handleLoginSuccess = (user: User) => {
     setCurrentUserId(user.id);
     setShowAuthModal(false);
     fetchDashboardData();
-    fetchProfileSettings();
+  };
+
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    setCurrentUserId('');
+    setDashboard(null);
+    setShowAuthModal(true);
+    setSessionChecked(true);
+    setShowSidebar(false);
   };
 
   const handleMarkNotificationRead = async (id: string) => {
     try {
-      await fetch(`/api/notifications/${id}/read`, { method: 'POST' });
+      await fetch(`/api/notifications/${id}/read`, { method: 'POST', credentials: 'include' });
       await fetchDashboardData();
     } catch (err) {
       console.error('Failed to mark notification read:', err);
@@ -475,8 +494,8 @@ export default function App() {
 
   const currentUser = dashboard.currentUser;
   const partnerUser = dashboard.partnerUser;
-  const currentProfile = profileSettings[currentUser.id] || getDefaultProfileSettings(currentUser);
-  const partnerProfile = profileSettings[partnerUser.id] || getDefaultProfileSettings(partnerUser);
+  const currentProfile = dashboard.profile || getDefaultProfileSettings(currentUser);
+  const partnerProfile = dashboard.partnerProfile || getDefaultProfileSettings(partnerUser);
   const fallbackJournal: DailyJournal = {
     id: '',
     userId: currentUser.id,
@@ -496,40 +515,50 @@ export default function App() {
   };
   const journalForView = currentJournal ?? fallbackJournal;
 
-  const tabs: Array<{ id: ActiveTab; label: string; icon: React.ReactNode; badge?: number | string }> = [
-    { id: 'TODAY', label: "Today's Mission", icon: <Trophy className="w-4 h-4" /> },
-    { id: 'ROADMAP', label: '100-Day Roadmap', icon: <Layers className="w-4 h-4" /> },
-    { id: 'LEDGER', label: 'Point Ledger', icon: <FileSpreadsheet className="w-4 h-4" /> },
-    { id: 'HABITS', label: 'Self-Control', icon: <Flame className="w-4 h-4" /> },
-    { id: 'JOURNAL', label: 'Today’s Live', icon: <BookOpen className="w-4 h-4" /> },
-    { id: 'ACHIEVEMENTS', label: 'Badges', icon: <Award className="w-4 h-4" /> },
-    { id: 'ANALYTICS', label: 'Head-to-Head', icon: <BarChart2 className="w-4 h-4" /> },
-    {
-      id: 'APPROVALS',
-      label: 'Mutual Approvals',
-      icon: <ShieldCheck className="w-4 h-4" />,
-      badge: dashboard.pendingApprovalsForUser.length > 0 ? dashboard.pendingApprovalsForUser.length : undefined,
-    },
-    { id: 'HISTORY', label: 'Activity History', icon: <History className="w-4 h-4" /> },
-  ];
-
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col selection:bg-indigo-500 selection:text-white">
-      {/* 1. Global Header Bar (Section 6) */}
-      <Navbar
+    <div className="app-shell min-h-screen text-slate-100 flex flex-col selection:bg-indigo-500 selection:text-white">
+      <DashboardSidebar
         currentUser={currentUser}
-        partnerUser={partnerUser}
-        dayInfo={dashboard.dayInfo}
-        notifications={dashboard.notifications}
-        remainingLeaves={dashboard.remainingLeaves ?? 5}
-        onOpenLeavesModal={() => setShowLeaveModal(true)}
-        onOpenCalendar={() => setShowCalendarModal(true)}
-        onMarkNotificationRead={handleMarkNotificationRead}
-        onMarkAllNotificationsRead={handleMarkAllNotificationsRead}
+          currentProfile={currentProfile}
+        activeTab={activeTab}
+        pendingApprovals={dashboard.pendingApprovalsForUser.length}
+        isOpen={showSidebar}
+        onClose={() => setShowSidebar(false)}
+        onAction={action => {
+          if (action.type === 'tab') {
+            setActiveTab(action.value);
+            if (action.value === 'JOURNAL') setJournalSubView('MY_JOURNAL');
+          } else if (action.type === 'calendar') {
+            setShowCalendarModal(true);
+          } else if (action.type === 'profile') {
+            setShowProfileEditor(true);
+          } else {
+            void handleLogout();
+          }
+        }}
       />
+      {/* 1. Global Header Bar (Section 6) */}
+      <div className="app-content">
+        <div className="mobile-topbar">
+          <MobileMenuButton onClick={() => setShowSidebar(true)} />
+          <div className="mobile-brand"><span className="brand-mark brand-mark-small">GC</span><strong>Great Coders</strong></div>
+          <span className="mobile-day">D{dashboard.dayInfo.dayNumber}</span>
+        </div>
+        <Navbar
+          currentUser={currentUser}
+          partnerUser={partnerUser}
+          currentProfile={currentProfile}
+          dayInfo={dashboard.dayInfo}
+          notifications={dashboard.notifications}
+          remainingLeaves={dashboard.remainingLeaves ?? 5}
+          onOpenLeavesModal={() => setShowLeaveModal(true)}
+          onOpenCalendar={() => setShowCalendarModal(true)}
+          onMarkNotificationRead={handleMarkNotificationRead}
+          onMarkAllNotificationsRead={handleMarkAllNotificationsRead}
+        />
 
       {/* Main Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+      <main className="dashboard-main flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
         {/* 2. Profile competition banner (LinkedIn-inspired profile header) */}
         <ProfileCompetitionBanner
           currentUser={currentUser}
@@ -626,67 +655,6 @@ export default function App() {
           </div>
         )}
 
-        {/* 3. Tab Navigation Bar & Quick Actions */}
-        <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
-          <div className="bg-slate-900/90 backdrop-blur-md p-1 sm:p-1.5 rounded-2xl border border-slate-800 flex items-center overflow-x-auto gap-1 shadow-md flex-1 scroll-smooth">
-            {tabs.map(tab => {
-              const isActive = activeTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  type="button"
-                  onClick={() => {
-                    setActiveTab(tab.id);
-                    if (tab.id === 'JOURNAL') {
-                      setJournalSubView('MY_JOURNAL');
-                    }
-                  }}
-                  className={`flex items-center gap-1.5 sm:gap-2 px-3 sm:px-3.5 py-2.5 rounded-xl text-xs font-semibold whitespace-nowrap transition-all cursor-pointer flex-shrink-0 min-h-[42px] relative ${
-                    isActive
-                      ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30 font-bold'
-                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-                  }`}
-                >
-                  {tab.icon}
-                  <span>{tab.label}</span>
-                  {tab.badge && (
-                    <span className="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-500 text-slate-950">
-                      {tab.badge}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
-            {/* Dedicated Button to Inspect & Rate Partner's Journal */}
-            <button
-              type="button"
-              onClick={() => {
-                setActiveTab('JOURNAL');
-                setJournalSubView('PARTNER_JOURNAL');
-              }}
-              className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-3 sm:px-3.5 py-2.5 rounded-2xl bg-purple-950/80 hover:bg-purple-900 border border-purple-500/40 text-xs font-bold text-purple-200 hover:text-white transition-all shadow-md cursor-pointer whitespace-nowrap min-h-[42px]"
-              title={`View ${partnerUser.name}'s Today’s Live and give a 1-5 star peer rating`}
-            >
-              <Star className="w-4 h-4 text-amber-400 fill-amber-400 flex-shrink-0" />
-              <span className="hidden xs:inline">{partnerUser.name}'s Journal</span>
-              <span className="xs:hidden">Partner Journal</span>
-              <span className="text-amber-400 font-semibold text-[11px]">& Rating</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setShowRulebook(true)}
-              className="flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-2xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-xs font-bold text-indigo-400 hover:text-indigo-300 transition-colors shadow-md cursor-pointer whitespace-nowrap min-h-[42px]"
-            >
-              <BookOpen className="w-4 h-4 text-indigo-400 flex-shrink-0" />
-              <span>Rules</span>
-            </button>
-          </div>
-        </div>
-
         {/* 4. Active Tab Content View */}
         <div className="animate-in fade-in duration-200">
           {activeTab === 'TODAY' && (
@@ -696,6 +664,8 @@ export default function App() {
                 checkinInfo={dashboard.dailyCheckinInfo}
                 currentUser={currentUser}
                 partnerUser={partnerUser}
+                currentProfile={currentProfile}
+                partnerProfile={partnerProfile}
                 isNightLockdown={dashboard.dayInfo.isNightLockdown}
                 onCheckinSuccess={(result) => {
                   setCheckinResult(result);
@@ -758,9 +728,11 @@ export default function App() {
               totalDays={roadmapData.totalDays}
               currentDayNumber={roadmapData.currentDayNumber}
               subjectPoints={roadmapData.subjectPoints}
-              pendingScheduleRequests={permissionsData.allRequests.filter(req => req.actionType === 'SCHEDULE_CHANGE')}
+              pendingScheduleRequests={permissionsData.allRequests.filter(req => req.actionType === 'SCHEDULE_CHANGE' || req.actionType === 'RETROACTIVE_COMPLETION')}
+              currentUserId={currentUserId}
               onSelectDay={dayNum => setSelectedInspectDay(dayNum)}
               onCompleteSection={handleCompleteSection}
+              onRequestCompletion={handleRequestCompletion}
             />
           )}
 
@@ -775,6 +747,7 @@ export default function App() {
             <HabitTracker
               myStats={habitData.myStats}
               partnerStreak={habitData.partnerStreak}
+              partnerBestStreak={habitData.partnerBestStreak}
               partnerCleanDays={habitData.partnerCleanDays}
               partnerName={habitData.partnerName}
               comparisonText={habitData.comparisonText}
@@ -796,6 +769,7 @@ export default function App() {
               initialView={journalSubView}
               onSaveJournal={handleSaveJournal}
               onRatePartner={handleRatePartner}
+              onRequestReset={handleRequestJournalReset}
             />
           )}
 
@@ -835,7 +809,11 @@ export default function App() {
           isOpen={selectedInspectDay !== null}
           onClose={() => setSelectedInspectDay(null)}
           currentUserId={currentUserId}
-          onApprovalRequested={fetchDashboardData}
+          onApprovalRequested={async () => {
+            await fetchDashboardData();
+            await fetchTabData('ROADMAP');
+            await fetchTabData('APPROVALS');
+          }}
         />
       )}
 
@@ -891,11 +869,8 @@ export default function App() {
             }
 
             const data = await res.json();
-            setProfileSettings(prev => ({
-              ...prev,
-              [currentUser.id]: data.profile,
-            }));
-            await fetchProfileSettings();
+            setDashboard(prev => prev ? { ...prev, profile: data.profile } : prev);
+            await fetchDashboardData();
           } catch (err) {
             console.error('Failed to save profile to server:', err);
             throw err;
@@ -918,6 +893,7 @@ export default function App() {
           Compete. Build. Learn. Improve.
         </p>
       </footer>
+    </div>
     </div>
   );
 }

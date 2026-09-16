@@ -1,5 +1,5 @@
 import React from 'react';
-import { Sparkles, Flame, Trophy, Coins, CheckCircle, ArrowRight, X } from 'lucide-react';
+import { Sparkles, Flame, Coins, CheckCircle, ArrowRight, X } from 'lucide-react';
 
 export interface CheckinResult {
   streak: number;
@@ -27,9 +27,6 @@ export const CheckinSuccessModal: React.FC<CheckinSuccessModalProps> = ({
   if (!isOpen || !result) return null;
 
   const streak = result.streak || 1;
-  const isBonus = !!result.bonusAwarded;
-  const dayInCycle = streak % 7 === 0 ? 7 : streak % 7;
-  const daysUntilNextBonus = streak % 7 === 0 ? 7 : 7 - (streak % 7);
 
   return (
     <div
@@ -43,9 +40,6 @@ export const CheckinSuccessModal: React.FC<CheckinSuccessModalProps> = ({
       >
         {/* Background glow effects */}
         <div className="absolute -top-24 left-1/2 -translate-x-1/2 w-64 h-64 bg-amber-500/20 rounded-full blur-3xl pointer-events-none" />
-        {isBonus && (
-          <div className="absolute -bottom-20 left-1/2 -translate-x-1/2 w-64 h-64 bg-emerald-500/20 rounded-full blur-3xl pointer-events-none" />
-        )}
 
         {/* Close Button */}
         <button
@@ -72,7 +66,7 @@ export const CheckinSuccessModal: React.FC<CheckinSuccessModalProps> = ({
 
         {/* Headline */}
         <h2 className="text-2xl sm:text-3xl font-black text-slate-100 tracking-tight">
-          {isBonus ? '🎉 7-Day Streak Bonus!' : '⚡ Checked In Successfully!'}
+          ⚡ Checked In Successfully!
         </h2>
         <p className="mt-1 text-sm text-slate-300 font-medium">
           Well done, <span className="text-amber-400 font-bold">{userName}</span>!
@@ -105,54 +99,13 @@ export const CheckinSuccessModal: React.FC<CheckinSuccessModalProps> = ({
           </div>
         </div>
 
-        {/* 7-Day Continuous Streak Bonus Alert if reached */}
-        {isBonus ? (
-          <div className="mt-4 p-4 rounded-2xl bg-gradient-to-r from-amber-500/20 via-emerald-500/20 to-amber-500/20 border-2 border-emerald-500/50 text-left">
-            <div className="flex items-center gap-2 text-emerald-400 font-bold text-sm">
-              <Trophy className="w-5 h-5 text-amber-400 fill-amber-400" />
-              7-Day Streak Milestone Unlocked!
-            </div>
-            <p className="mt-1 text-xs text-slate-200">
-              You continuously maintained 7 days of daily discipline.
-              <span className="font-bold text-emerald-300"> +5 Extra Points</span> have been credited to your competition ledger! (Total: +6 Points)
-            </p>
+        <div className="mt-5 p-4 rounded-2xl bg-slate-950/60 border border-slate-800/80 text-left">
+          <div className="flex items-center gap-1.5 text-slate-300 font-semibold text-xs">
+            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+            Daily point recorded
           </div>
-        ) : (
-          /* Next Milestone Progress Bar */
-          <div className="mt-5 p-4 rounded-2xl bg-slate-950/60 border border-slate-800/80 text-left">
-            <div className="flex items-center justify-between text-xs mb-2">
-              <span className="text-slate-300 font-semibold flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                7-Day Bonus Progress
-              </span>
-              <span className="text-amber-400 font-bold">
-                {daysUntilNextBonus} {daysUntilNextBonus === 1 ? 'day' : 'days'} to +5 pts
-              </span>
-            </div>
-
-            {/* 7-day visual dots */}
-            <div className="grid grid-cols-7 gap-1.5">
-              {[1, 2, 3, 4, 5, 6, 7].map(day => {
-                const isCompleted = day <= dayInCycle;
-                const isGoal = day === 7;
-                return (
-                  <div
-                    key={day}
-                    className={`h-7 rounded-lg flex flex-col items-center justify-center border text-[10px] font-bold transition-all ${
-                      isCompleted
-                        ? 'bg-amber-500/30 border-amber-400 text-amber-200 shadow-sm'
-                        : isGoal
-                        ? 'bg-slate-800/80 border-amber-500/40 text-amber-400'
-                        : 'bg-slate-900 border-slate-800 text-slate-500'
-                    }`}
-                  >
-                    {isGoal ? '🎁+5' : `D${day}`}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
+          <p className="mt-1 text-xs text-slate-400">Your +1 check-in point is now part of the server-backed ledger.</p>
+        </div>
 
         {/* Motivational confirmation */}
         <p className="mt-4 text-xs text-slate-400 flex items-center justify-center gap-1.5">

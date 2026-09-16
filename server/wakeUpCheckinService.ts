@@ -162,7 +162,7 @@ export async function recordWakeUpCheckin(pool: Pool, legacyUserId: string) {
     await client.query(
       `INSERT INTO wake_up_checkins
          (participant_id, challenge_day_id, checkin_date, status, checked_in_at, points_awarded, created_at, updated_at)
-       VALUES ($1, $2, $3, 'COMPLETED', $4, 2, $4, $4)
+         VALUES ($1, $2, $3, 'COMPLETED', $4, 1, $4, $4)
        ON CONFLICT (participant_id, challenge_day_id)
        DO UPDATE SET status = 'COMPLETED', checked_in_at = EXCLUDED.checked_in_at,
                      points_awarded = 2, updated_at = EXCLUDED.updated_at`,
@@ -171,14 +171,14 @@ export async function recordWakeUpCheckin(pool: Pool, legacyUserId: string) {
     await client.query(
       `INSERT INTO points_ledger
          (participant_id, challenge_id, challenge_day_id, amount, event_type, reason, metadata, created_at)
-       VALUES ($1, $2, $3, 2, 'MORNING_CHECKIN_SUCCESS', $4, $5::jsonb, $6)`,
-      [id, day.challenge_id, day.id, 'Disciplined early morning wake-up check-in (+2 pts)', JSON.stringify({ date: currentDate }), nowIso]
+      VALUES ($1, $2, $3, 1, 'MORNING_CHECKIN_SUCCESS', $4, $5::jsonb, $6)`,
+          [id, day.challenge_id, day.id, 'Disciplined early morning wake-up check-in (+1 pt)', JSON.stringify({ date: currentDate }), nowIso]
     );
     const stats = calculateStreak(await historyForParticipant(client, id));
     await client.query('COMMIT');
     return {
       alreadyCheckedIn: false,
-      checkin: { id: `morning-${legacyUserId}-${currentDate}`, userId: legacyUserId, date: currentDate, checkedInAt: nowIso, status: 'CHECKED_IN' as const, points: 2 },
+      checkin: { id: `morning-${legacyUserId}-${currentDate}`, userId: legacyUserId, date: currentDate, checkedInAt: nowIso, status: 'CHECKED_IN' as const, points: 1 },
       stats,
     };
   } catch (error) {

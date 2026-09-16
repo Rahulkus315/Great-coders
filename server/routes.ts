@@ -1,6 +1,6 @@
 import express from 'express';
+import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
-import { OAuth2Client } from 'google-auth-library';
 import { getRuntimePool, store } from './store';
 import { calculateDayInfo, getISTDateString, getISTNow } from './timeUtils';
 import {
@@ -19,6 +19,7 @@ import { finalizeFocusedExecution } from './focusedExecutionLock';
 import { completeTask, completeTaskSection, TaskCompletionError, undoTaskSection } from './taskCompletionService';
 import { getWakeUpCheckin, getWakeUpStats, recordWakeUpCheckin, WakeUpCheckinError } from './wakeUpCheckinService';
 import { applyLeave, DailyActivityError, getDailyCheckinStats, listLeaves, recordDailyCheckin } from './dailyActivityService';
+import { ensureParticipantSchedule, getParticipantEffectiveDates } from './participantScheduleService';
 import { DsaServiceError, getDsaAttempt, recordDsaAttempt } from './dsaService';
 import { getHabitData, HabitJournalError, recordRelapse, getJournalData, saveJournal } from './habitJournalService';
 import { listAuditLogs, listLedger, listNotifications, markAllNotificationsRead, markNotificationRead } from './notificationService';
@@ -26,7 +27,7 @@ import { ScheduleSection, SubjectCategory } from '../src/types';
 import type { AppState } from './store';
 
 const DAILY_SCHEDULE_SECTIONS: ScheduleSection[] = ['DSA', 'JAVA', 'OS', 'DBMS'];
-const SECTION_POINTS: Record<ScheduleSection, number> = { DSA: 10, JAVA: 10, OS: 8, DBMS: 8 };
+const SECTION_POINTS: Record<ScheduleSection, number> = { DSA: 3, JAVA: 2, OS: 1, DBMS: 1 };
 const SECTION_CATEGORIES: Record<ScheduleSection, SubjectCategory> = {
   DSA: 'DSA',
   JAVA: 'CORE_JAVA',
@@ -34,22 +35,13 @@ const SECTION_CATEGORIES: Record<ScheduleSection, SubjectCategory> = {
   DBMS: 'DBMS',
 };
 
-const googleClientId = process.env.GOOGLE_CLIENT_ID || '';
-const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET || '';
-const googleRedirectUri = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/auth/google/callback';
-const googleClient = googleClientId ? new OAuth2Client(googleClientId, googleClientSecret, googleRedirectUri) : null;
-const GOOGLE_PARTICIPANT_BY_EMAIL = {
-  'rahulkushwaha181@gmail.com': 'user-rahul',
-  'dileepkewat011@gmail.com': 'user-dileep',
-} as const;
-
 const SESSION_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30;
 
-async function setAuthCookie(res: express.Response, userId: string) {
+async function createAuthSession(client: { query: (text: string, values?: unknown[]) => Promise<unknown> }, res: express.Response, userId: string) {
   const secure = process.env.NODE_ENV === 'production';
   const token = crypto.randomBytes(32).toString('base64url');
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-  await getRuntimePool().query(
+  await client.query(
     `INSERT INTO auth_sessions (session_token_hash, participant_id, expires_at)
      SELECT $1, id, now() + interval '30 days' FROM participants WHERE legacy_id = $2 AND status = 'ACTIVE'`,
     [tokenHash, userId]
@@ -69,11 +61,6 @@ async function clearAuthCookie(req: express.Request, res: express.Response) {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     await getRuntimePool().query('UPDATE auth_sessions SET revoked_at = now() WHERE session_token_hash = $1', [tokenHash]);
   }
-  res.clearCookie('session_user_id', {
-    httpOnly: true,
-    secure,
-    sameSite: 'lax',
-  });
   res.clearCookie('session_token', { httpOnly: true, secure, sameSite: 'lax' });
 }
 
@@ -221,212 +208,53 @@ export function buildUserExport(state: AppState, userId: string) {
   };
 }
 
-// ----------------------------------------------------------------------
-// 1. AUTHENTICATION & IDENTITY LOCKING
-// ----------------------------------------------------------------------
-apiRouter.get('/auth/google/start', async (req, res) => {
-  if (!googleClient) {
-    return res.status(500).json({
-      error: 'Google OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI.',
-    });
-  }
-
-  const participantId = req.query.participant === 'user-dileep' ? 'user-dileep' : 'user-rahul';
-  const stateToken = crypto.randomBytes(32).toString('base64url');
-  const stateHash = crypto.createHash('sha256').update(stateToken).digest('hex');
-  await getRuntimePool().query(
-    `INSERT INTO oauth_states (state_token_hash, participant_id, expires_at)
-     SELECT $1, id, now() + interval '10 minutes' FROM participants WHERE legacy_id = $2 AND status = 'ACTIVE'`,
-    [stateHash, participantId]
-  );
-  const authUrl = googleClient.generateAuthUrl({
-    access_type: 'offline',
-    prompt: 'consent',
-    include_granted_scopes: true,
-    scope: ['openid', 'email', 'profile'],
-    state: stateToken,
-  });
-
-  res.redirect(authUrl);
-});
-
-apiRouter.get('/auth/google/callback', async (req, res) => {
-  try {
-    if (!googleClient) {
-      return res.redirect('/?auth_error=' + encodeURIComponent('Google Sign-In failed. Please try again.'));
-    }
-
-    const { code, state } = req.query as { code?: string; state?: string };
-    if (!code) {
-      return res.redirect('/?auth_error=' + encodeURIComponent('Google Sign-In failed. Please try again.'));
-    }
-
-    if (!state) throw new Error('Google OAuth state is missing');
-    const stateHash = crypto.createHash('sha256').update(String(state)).digest('hex');
-    const oauthState = await getRuntimePool().query(
-      `UPDATE oauth_states SET consumed_at = now()
-       WHERE state_token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
-       RETURNING participant_id`, [stateHash]
-    );
-    if (!oauthState.rowCount) throw new Error('Google OAuth state is invalid or expired');
-    const participantRow = await getRuntimePool().query('SELECT legacy_id FROM participants WHERE id = $1 AND status = \'ACTIVE\'', [oauthState.rows[0].participant_id]);
-    if (!participantRow.rowCount) throw new Error('Requested challenge participant could not be found');
-    const participantId = participantRow.rows[0].legacy_id as 'user-rahul' | 'user-dileep';
-
-    const { tokens } = await googleClient.getToken({
-      code: String(code),
-      redirect_uri: googleRedirectUri,
-    });
-
-    if (!tokens.id_token) {
-      throw new Error('Google token exchange did not return an id_token');
-    }
-
-    const ticket = await googleClient.verifyIdToken({
-      idToken: tokens.id_token,
-      audience: googleClientId,
-    });
-
-    const payload = ticket.getPayload();
-    if (!payload || !payload.sub || !payload.email || payload.email_verified === false) {
-      throw new Error('Google identity payload is invalid or email is not verified');
-    }
-
-    const providerSubject = payload.sub;
-    const googleEmail = payload.email.toLowerCase().trim();
-    const allowedParticipantId = GOOGLE_PARTICIPANT_BY_EMAIL[googleEmail as keyof typeof GOOGLE_PARTICIPANT_BY_EMAIL];
-    if (!allowedParticipantId || allowedParticipantId !== participantId) {
-      return res.status(403).send('Access Denied: this Google account is not authorized for the Great Coders challenge.');
-    }
-    const existingIdentity = await getRuntimePool().query(
-      `SELECT ai.participant_id, p.legacy_id FROM authentication_identities ai
-       JOIN participants p ON p.id = ai.participant_id
-       WHERE ai.provider = 'GOOGLE' AND ai.provider_subject = $1`, [providerSubject]
-    );
-
-    if (existingIdentity.rowCount) {
-      if (existingIdentity.rows[0].legacy_id !== participantId) throw new Error('This Google account is already permanently associated with another participant');
-      await setAuthCookie(res, existingIdentity.rows[0].legacy_id);
-      return res.redirect('/');
-    }
-
-    const boundGoogleIdentities = await getRuntimePool().query("SELECT count(*)::int AS count FROM authentication_identities WHERE provider = 'GOOGLE'");
-    if (Number(boundGoogleIdentities.rows[0].count) >= 2) {
-      return res.redirect('/?auth_error=' + encodeURIComponent('Challenge registration is closed. This challenge supports only Rahul and Dileep.'));
-    }
-    const participantAlreadyBound = await getRuntimePool().query("SELECT 1 FROM authentication_identities ai JOIN participants p ON p.id=ai.participant_id WHERE ai.provider='GOOGLE' AND p.legacy_id=$1", [participantId]);
-    if (participantAlreadyBound.rowCount) {
-      return res.redirect('/?auth_error=' + encodeURIComponent('This participant already has a permanently bound Google identity.'));
-    }
-
-    const stateStore = store.getState();
-    const bindTarget = stateStore.users.find(u => u.id === participantId);
-    if (!bindTarget) {
-      return res.redirect('/?auth_error=' + encodeURIComponent('Requested challenge participant could not be found.'));
-    }
-
-    const pendingToken = crypto.randomBytes(32).toString('base64url');
-    await getRuntimePool().query(
-      `INSERT INTO oauth_bind_transactions (transaction_token_hash, participant_id, provider, provider_subject, email, email_verified, expires_at)
-       SELECT $1, id, 'GOOGLE', $2, $3, $4, now() + interval '10 minutes' FROM participants WHERE legacy_id = $5`,
-      [crypto.createHash('sha256').update(pendingToken).digest('hex'), providerSubject, payload.email, !!payload.email_verified, participantId]
-    );
-
-    res.cookie('pending_google_bind', pendingToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 5 * 60 * 1000,
-    });
-
-    return res.redirect('/?auth=bind&participant=' + participantId + '&email=' + encodeURIComponent(payload.email));
-  } catch (error: any) {
-    console.error('Google callback error', error);
-    return res.redirect('/?auth_error=' + encodeURIComponent('Google Sign-In failed. Please try again.'));
-  }
-});
-
-apiRouter.post('/auth/google/bind', async (req, res) => {
-  const pendingToken = req.cookies?.pending_google_bind;
-  if (typeof pendingToken !== 'string') {
-    return res.status(400).json({ error: 'Google binding transaction is missing or expired.' });
-  }
-  try {
-    const tokenHash = crypto.createHash('sha256').update(pendingToken).digest('hex');
-    const bind = await getRuntimePool().query(
-      `UPDATE oauth_bind_transactions SET consumed_at = now()
-       WHERE transaction_token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
-       RETURNING participant_id, provider, provider_subject, email, email_verified`, [tokenHash]
-    );
-    if (!bind.rowCount || bind.rows[0].provider !== 'GOOGLE') {
-      return res.status(400).json({ error: 'Google binding transaction is missing or expired.' });
-    }
-    const pending = bind.rows[0];
-    const allowedParticipantId = GOOGLE_PARTICIPANT_BY_EMAIL[String(pending.email).toLowerCase().trim() as keyof typeof GOOGLE_PARTICIPANT_BY_EMAIL];
-    if (!allowedParticipantId) {
-      return res.status(403).json({ error: 'Access Denied: this Google account is not authorized for the Great Coders challenge.' });
-    }
-    const participant = await getRuntimePool().query(
-      'SELECT legacy_id AS id, display_name AS name, email, avatar_url AS avatar, target_role AS "targetRole", bound_identity AS "boundIdentity" FROM participants WHERE id = $1 AND status = \'ACTIVE\'',
-      [pending.participant_id]
-    );
-    if (!participant.rowCount) return res.status(404).json({ error: 'Participant not found.' });
-    const participantId = participant.rows[0].id as string;
-    if (allowedParticipantId !== participantId) {
-      return res.status(403).json({ error: 'Access Denied: Google identity does not match the requested participant.' });
-    }
-    const requestedParticipant = req.body?.participantId;
-    if (requestedParticipant !== undefined && requestedParticipant !== participantId) {
-      return res.status(403).json({ error: 'Participant identity is controlled by the OAuth transaction.' });
-    }
-    const conflict = await getRuntimePool().query(
-      `SELECT ai.participant_id FROM authentication_identities ai WHERE ai.provider = 'GOOGLE' AND ai.provider_subject = $1`,
-      [pending.provider_subject]
-    );
-    if (conflict.rowCount && conflict.rows[0].participant_id !== pending.participant_id) {
-      return res.status(409).json({ error: 'This Google account is already permanently associated with another participant.' });
-    }
-    const participantBound = await getRuntimePool().query(
-      `SELECT 1 FROM authentication_identities WHERE provider = 'GOOGLE' AND participant_id = $1`, [pending.participant_id]
-    );
-    if (participantBound.rowCount && !conflict.rowCount) {
-      return res.status(409).json({ error: 'This participant already has a permanent Google binding.' });
-    }
-    const identity = await getRuntimePool().query(
-      `INSERT INTO authentication_identities (provider, provider_subject, email, email_verified, participant_id, last_login_at)
-       VALUES ('GOOGLE', $1, $2, $3, $4, now())
-       ON CONFLICT (provider, provider_subject) DO UPDATE SET last_login_at = now()
-       RETURNING id`, [pending.provider_subject, pending.email, pending.email_verified, pending.participant_id]
-    );
-    await setAuthCookie(res, participantId);
-    res.clearCookie('pending_google_bind');
-    const userClean = participant.rows[0];
-    return res.json({
-      success: true,
-      user: userClean,
-      message: `Welcome, ${userClean.name}! Your Google account is permanently bound to this challenge identity.`,
-      identityId: identity.rows[0].id,
-    });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'Google binding failed.' });
-  }
-});
-
 apiRouter.post('/auth/logout', async (req, res) => {
   await clearAuthCookie(req, res);
   res.json({ success: true, message: 'Logged out successfully.' });
 });
 
-apiRouter.get('/auth/me', (req, res) => {
-  const user = requireAuthUser(req, res);
-  if (!user) return;
-
-  const { passwordHash, ...userClean } = user;
-  res.json({ user: userClean, authenticated: true });
-});
-
 apiRouter.post('/auth/login', async (req, res) => {
-  return res.status(403).json({ error: 'Access Denied: Google OAuth is required.' });
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!email || !password) {
+    return res.status(401).json({ error: 'Invalid email or password.' });
+  }
+
+  try {
+    const result = await getRuntimePool().query(
+      `SELECT legacy_id AS id, display_name AS name, email, avatar_url AS avatar,
+              target_role AS "targetRole", bound_identity AS "boundIdentity", password_hash AS "passwordHash"
+       FROM participants WHERE status = 'ACTIVE' AND lower(email) = $1 LIMIT 1`,
+      [email]
+    );
+    const participant = result.rows[0];
+    const passwordHash = typeof participant?.passwordHash === 'string' ? participant.passwordHash : '';
+    const passwordMatches = passwordHash ? await bcrypt.compare(password, passwordHash) : false;
+    if (!participant || !passwordMatches) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+
+    const client = await getRuntimePool().connect();
+    try {
+      await client.query('BEGIN');
+      await createAuthSession(client, res, participant.id);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    loginAttempts.delete(req.ip || req.socket.remoteAddress || 'unknown');
+
+    const { passwordHash: _passwordHash, ...user } = participant;
+    return res.json({ authenticated: true, user });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'Invalid email or password.') {
+      return res.status(401).json({ error: error.message });
+    }
+    return res.status(500).json({ error: 'Authentication service unavailable.' });
+  }
 });
 
 apiRouter.get('/auth/me', (req, res) => {
@@ -507,17 +335,23 @@ apiRouter.get('/dashboard', async (req, res) => {
     const isOnLeaveToday = userLeaves.some(l => l.date === currentDate);
     const partnerOnLeaveToday = partnerLeaves.some(l => l.date === currentDate);
 
-    // Schedule shift logic: each past approved leave shifts the user's task curriculum forward by 1 day
-    const pastLeavesCount = userLeaves.filter(l => l.date < currentDate).length;
-    const userEffectiveDayNumber = Math.max(1, overview.dayInfo.dayNumber - pastLeavesCount);
+    const currentChallenge = (await getRuntimePool().query(
+      `SELECT id FROM challenges WHERE start_date <= $1 AND end_date >= $1 ORDER BY start_date DESC LIMIT 1`,
+      [currentDate],
+    )).rows[0];
+    const effectiveDates = currentChallenge
+      ? await getParticipantEffectiveDates(getRuntimePool(), currentUser.id, currentChallenge.id)
+      : new Map<number, string>();
+    const effectiveDayNumber = Array.from(effectiveDates.entries()).find(([, date]) => date === currentDate)?.[0] || null;
+    const isApprovedHoliday = isOnLeaveToday;
+    const todayTask = isApprovedHoliday
+      ? null
+      : state.tasks.find(task => task.dayNumber === effectiveDayNumber) || null;
+    const userEffectiveDayNumber = effectiveDayNumber;
 
-    // Attach today's task and DSA for quick view (null if user is on leave today)
-    const todayTask = isOnLeaveToday
-      ? null
-      : state.tasks.find(t => t.dayNumber === userEffectiveDayNumber) || null;
-    const todayDsa = isOnLeaveToday
-      ? null
-      : state.dsaProblems.find(p => p.dayNumber === userEffectiveDayNumber) || null;
+    const todayDsa = todayTask
+      ? state.dsaProblems.find(problem => problem.dayNumber === todayTask.dayNumber) || null
+      : null;
 
     const todayMorningCheckin = await getWakeUpCheckin(getRuntimePool(), currentUser.id, currentDate);
 
@@ -636,8 +470,8 @@ apiRouter.get('/dashboard', async (req, res) => {
       partnerLeaves,
       leavesUsed: userLeaves.length,
       remainingLeaves: Math.max(0, 5 - userLeaves.length),
-      isOnLeaveToday,
-      partnerOnLeaveToday,
+      isOnLeaveToday: isApprovedHoliday,
+      partnerOnLeaveToday: isApprovedHoliday,
       userEffectiveDayNumber,
       notifications,
       pendingApprovalsForUser,
@@ -659,6 +493,47 @@ apiRouter.post('/tasks/:id/sections/:section/complete', async (req, res) => {
   } catch (error) {
     const statusCode = error instanceof TaskCompletionError ? error.statusCode : 500;
     return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+apiRouter.post('/tasks/:id/sections/:section/request-completion', async (req, res) => {
+  const currentUser = requireAuthUser(req, res);
+  if (!currentUser) return;
+  const section = String(req.params.section || '').toUpperCase();
+  if (!['DSA', 'JAVA', 'OS', 'DBMS'].includes(section)) return res.status(400).json({ error: 'Invalid curriculum section.' });
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+  if (reason.length < 5) return res.status(400).json({ error: 'Please provide a clear reason for requesting late completion.' });
+
+  try {
+    const task = (await getRuntimePool().query(
+      `SELECT ct.legacy_id, split_part(ct.legacy_id, '-', 1) || '-' || split_part(ct.legacy_id, '-', 2) || '-' || split_part(ct.legacy_id, '-', 3) AS "taskId", cd.curriculum_day_number AS "dayNumber", ct.title, cd.calendar_date::text AS date
+       FROM curriculum_tasks ct JOIN challenge_days cd ON cd.id = ct.challenge_day_id
+       WHERE ct.legacy_id = $1 LIMIT 1`,
+      [`${req.params.id}-${section}`],
+    )).rows[0];
+    if (!task) return res.status(404).json({ error: 'Task not found in PostgreSQL.' });
+    const currentDate = calculateDayInfo().currentDate;
+    const taskChallenge = (await getRuntimePool().query(
+      `SELECT challenge_id AS "challengeId" FROM curriculum_tasks WHERE legacy_id = $1 LIMIT 1`,
+      [`${task.legacy_id}`],
+    )).rows[0];
+    const participantSchedule = taskChallenge
+      ? await getParticipantEffectiveDates(getRuntimePool(), currentUser.id, taskChallenge.challengeId)
+      : new Map<number, string>();
+    const effectiveTaskDate = participantSchedule.get(Number(task.dayNumber)) || task.date;
+    if (effectiveTaskDate >= currentDate) return res.status(400).json({ error: 'Only past scheduled tasks require late-completion approval.' });
+
+    const entityId = `${task.taskId}::${section}`;
+    const request = await createPermissionRequest(
+      currentUser.id,
+      'RETROACTIVE_COMPLETION',
+      entityId,
+      `${section} - ${task.title} (${effectiveTaskDate})`,
+      reason,
+    );
+    return res.json({ success: true, message: 'Late-completion request sent to your partner.', request });
+  } catch (error) {
+    return res.status((error as any)?.statusCode || 400).json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
 
@@ -893,10 +768,9 @@ apiRouter.post('/legacy/checkin', async (req, res) => {
 
     const newStreak = yesterdayCheckin ? (yesterdayCheckin.streakDay || 1) + 1 : 1;
 
-    // 3. 7-Day Continuous Streak bonus (+5 extra points)
-    const is7DayBonus = newStreak > 0 && newStreak % 7 === 0;
-    const bonusPoints = is7DayBonus ? 5 : 0;
-    const totalCoinsForThisCheckin = 1 + bonusPoints;
+    const is7DayBonus = false;
+    const bonusPoints = 0;
+    const totalCoinsForThisCheckin = 1;
 
     const nowIso = getISTNow().toISOString();
     const checkinRecord = {
@@ -931,22 +805,6 @@ apiRouter.post('/legacy/checkin', async (req, res) => {
     });
     curPts += 1;
 
-    // 7-day continuous streak bonus: +5 extra points
-    if (is7DayBonus) {
-      state.pointLedger.push({
-        id: `ledger-checkin-bonus-${user.id}-${Date.now()}`,
-        userId: user.id,
-        date: currentDate,
-        timestamp: nowIso,
-        eventType: 'CHECKIN_STREAK_7_BONUS',
-        points: 5,
-        runningTotal: curPts + 5,
-        reason: `🎉 7-Day Continuous Streak Milestone Achieved! (+5 Extra Points Awarded)`,
-        category: 'DISCIPLINE',
-      });
-      curPts += 5;
-    }
-
     // 5. Audit log
     state.auditLogs.unshift({
       id: `audit-checkin-${Date.now()}`,
@@ -956,7 +814,7 @@ apiRouter.post('/legacy/checkin', async (req, res) => {
       targetType: 'STREAK_RECORD',
       targetId: currentDate,
       reason: is7DayBonus
-        ? `Checked in for ${currentDate}. Earned +1 Coin and maintained 7-Day streak (+5 Bonus Points)! Streak: ${newStreak} days.`
+        ? `Checked in for ${currentDate}. Earned +1 point. Streak: ${newStreak} days.`
         : `Checked in for ${currentDate}. Earned +1 Coin and incremented streak to ${newStreak} days.`,
       timestamp: nowIso,
     });
@@ -997,7 +855,7 @@ apiRouter.post('/legacy/checkin', async (req, res) => {
     res.json({
       success: true,
       message: is7DayBonus
-        ? `🔥 Incredible! 7-Day Streak achieved! +1 Coin & +5 Extra Bonus Points awarded!`
+        ? `Check-in confirmed! +1 point awarded.`
         : `⚡ Check-In confirmed! +1 Coin and Streak +1 added.`,
       streak: newStreak,
       coinsAwarded: 1,
@@ -1186,6 +1044,41 @@ apiRouter.get('/roadmap', async (req, res) => {
   await store.refreshFromDatabase();
   const state = store.getState();
   const dayInfo = calculateDayInfo();
+  const scheduleContext = await getRuntimePool().query(
+    `SELECT ct.challenge_id AS "challengeId"
+     FROM curriculum_tasks ct
+     WHERE ct.legacy_id = $1
+     LIMIT 1`,
+    [`${state.tasks[0]?.id || ''}-DSA`],
+  );
+  const challengeId = scheduleContext.rows[0]?.challengeId as string | undefined;
+  const effectiveDates = new Map<number, string>();
+  if (challengeId) {
+    const participant = await getRuntimePool().query(
+      `SELECT id FROM participants WHERE legacy_id = $1 AND status = 'ACTIVE'`,
+      [currentUser.id],
+    );
+    if (participant.rowCount) {
+      const client = await getRuntimePool().connect();
+      try {
+        await client.query('BEGIN');
+        await ensureParticipantSchedule(client, participant.rows[0].id, challengeId);
+        const schedule = await client.query(
+          `SELECT curriculum_day_number AS "dayNumber", effective_date::text AS date
+           FROM participant_schedule_days WHERE participant_id = $1 AND challenge_id = $2`,
+          [participant.rows[0].id, challengeId],
+        );
+        for (const row of schedule.rows) effectiveDates.set(Number(row.dayNumber), row.date);
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+  }
+  const participantCurrentDayNumber = Array.from(effectiveDates.entries()).find(([, date]) => date === dayInfo.currentDate)?.[0] || dayInfo.dayNumber;
 
   // Annotate tasks with user status
   const tasksWithStatus = state.tasks.map(task => {
@@ -1205,14 +1098,16 @@ apiRouter.get('/roadmap', async (req, res) => {
       ])
     );
 
+    const effectiveDate = effectiveDates.get(task.dayNumber) || task.date;
     return {
       ...task,
+      date: effectiveDate,
       dsaProblem: dsa,
       sectionStatuses,
       userStatus: userStatus?.status || 'PENDING',
       dsaSolved: dsaAttempt?.status === 'SOLVED',
-      isCurrentDay: task.dayNumber === dayInfo.dayNumber,
-      isLocked: task.dayNumber > dayInfo.dayNumber,
+      isCurrentDay: effectiveDate === dayInfo.currentDate,
+      isLocked: effectiveDate > dayInfo.currentDate,
     };
   });
 
@@ -1231,7 +1126,7 @@ apiRouter.get('/roadmap', async (req, res) => {
 
   res.json({
     totalDays: state.tasks.length,
-    currentDayNumber: dayInfo.dayNumber,
+    currentDayNumber: participantCurrentDayNumber,
     tasks: tasksWithStatus,
     subjectPoints,
   });
@@ -1300,11 +1195,21 @@ apiRouter.get('/history/calendar-overview', async (req, res) => {
     state.journals = state.journals || [];
     state.pointLedger = state.pointLedger || [];
     state.dsaAttempts = state.dsaAttempts || [];
+    const calendarChallenge = (await getRuntimePool().query(
+      `SELECT challenge_id AS "challengeId" FROM curriculum_tasks WHERE legacy_id = $1 LIMIT 1`,
+      [`${state.tasks[0]?.id || ''}-DSA`],
+    )).rows[0];
+    const effectiveDates = calendarChallenge
+      ? await getParticipantEffectiveDates(getRuntimePool(), currentUser.id, calendarChallenge.challengeId)
+      : new Map<number, string>();
+    const participantCurrentDayNumber = Array.from(effectiveDates.entries())
+      .find(([, date]) => date === dayInfo.currentDate)?.[0] || dayInfo.dayNumber;
 
     const days = state.tasks.map(task => {
-      const isPast = task.dayNumber < dayInfo.dayNumber;
-      const isCurrent = task.dayNumber === dayInfo.dayNumber;
-      const isFuture = task.dayNumber > dayInfo.dayNumber;
+      const date = effectiveDates.get(task.dayNumber) || task.date;
+      const isPast = date < dayInfo.currentDate;
+      const isCurrent = date === dayInfo.currentDate;
+      const isFuture = date > dayInfo.currentDate;
       const isUnlocked = !isFuture;
 
       const myStatus = state.taskStatuses.find(
@@ -1315,23 +1220,23 @@ apiRouter.get('/history/calendar-overview', async (req, res) => {
       );
 
       const myJournal = state.journals.find(
-        j => j.userId === currentUser.id && j.date === task.date
+        j => j.userId === currentUser.id && j.date === date
       );
       const partnerJournal = state.journals.find(
-        j => j.userId === partnerUser.id && j.date === task.date
+        j => j.userId === partnerUser.id && j.date === date
       );
 
       const myPoints = state.pointLedger
-        .filter(e => e.userId === currentUser.id && e.date === task.date)
+        .filter(e => e.userId === currentUser.id && e.date === date)
         .reduce((sum, e) => sum + e.points, 0);
 
       const partnerPoints = state.pointLedger
-        .filter(e => e.userId === partnerUser.id && e.date === task.date)
+        .filter(e => e.userId === partnerUser.id && e.date === date)
         .reduce((sum, e) => sum + e.points, 0);
 
       return {
         dayNumber: task.dayNumber,
-        date: task.date,
+        date,
         title: task.title,
         category: task.category,
         priority: task.priority,
@@ -1349,7 +1254,7 @@ apiRouter.get('/history/calendar-overview', async (req, res) => {
     });
 
     res.json({
-      currentDayNumber: dayInfo.dayNumber,
+      currentDayNumber: participantCurrentDayNumber,
       currentDate: dayInfo.currentDate,
       totalDays: 100,
       challengeStartDate: dayInfo.challengeStartDate,
@@ -1369,6 +1274,8 @@ apiRouter.get('/day/:day', async (req, res) => {
     await store.refreshFromDatabase();
     const state = store.getState();
     const partnerUser = state.users.find(u => u.id !== currentUser.id) || state.users[1];
+    const currentProfile = state.profiles?.[currentUser.id] || getDefaultProfile(currentUser);
+    const partnerProfile = state.profiles?.[partnerUser.id] || getDefaultProfile(partnerUser);
     const dayInfo = calculateDayInfo();
 
     const task = state.tasks.find(t => t.dayNumber === dayNum);
@@ -1376,10 +1283,20 @@ apiRouter.get('/day/:day', async (req, res) => {
       return res.status(404).json({ error: 'Day not found' });
     }
 
+    const dayChallenge = (await getRuntimePool().query(
+      `SELECT challenge_id AS "challengeId" FROM curriculum_tasks WHERE legacy_id = $1 LIMIT 1`,
+      [`${task.id}-DSA`],
+    )).rows[0];
+    const effectiveDates = dayChallenge
+      ? await getParticipantEffectiveDates(getRuntimePool(), currentUser.id, dayChallenge.challengeId)
+      : new Map<number, string>();
+    const effectiveDate = effectiveDates.get(dayNum) || task.date;
+    const participantCurrentDayNumber = Array.from(effectiveDates.entries())
+      .find(([, date]) => date === dayInfo.currentDate)?.[0] || dayInfo.dayNumber;
     const dsaProblem = state.dsaProblems.find(d => d.dayNumber === dayNum);
-    const isPast = dayNum < dayInfo.dayNumber;
-    const isCurrent = dayNum === dayInfo.dayNumber;
-    const isFuture = dayNum > dayInfo.dayNumber;
+    const isPast = effectiveDate < dayInfo.currentDate;
+    const isCurrent = effectiveDate === dayInfo.currentDate;
+    const isFuture = effectiveDate > dayInfo.currentDate;
 
     // Task statuses
     const userTaskStatus = state.taskStatuses.find(
@@ -1400,61 +1317,86 @@ apiRouter.get('/day/:day', async (req, res) => {
     // Journals for this date
     state.journals = state.journals || [];
     const userJournal = state.journals.find(
-      j => j.userId === currentUser.id && j.date === task.date
+      j => j.userId === currentUser.id && j.date === effectiveDate
     ) || null;
     const partnerJournal = state.journals.find(
-      j => j.userId === partnerUser.id && j.date === task.date
+      j => j.userId === partnerUser.id && j.date === effectiveDate
     ) || null;
 
     // Daily checkins
     state.dailyCheckins = state.dailyCheckins || [];
     const userCheckin = state.dailyCheckins.find(
-      c => c.userId === currentUser.id && c.date === task.date
+      c => c.userId === currentUser.id && c.date === effectiveDate
     ) || null;
     const partnerCheckin = state.dailyCheckins.find(
-      c => c.userId === partnerUser.id && c.date === task.date
+      c => c.userId === partnerUser.id && c.date === effectiveDate
     ) || null;
 
     // Ledger entries on this day
     const userDayLedger = state.pointLedger.filter(
-      e => e.userId === currentUser.id && e.date === task.date
+      e => e.userId === currentUser.id && e.date === effectiveDate
     );
     const partnerDayLedger = state.pointLedger.filter(
-      e => e.userId === partnerUser.id && e.date === task.date
+      e => e.userId === partnerUser.id && e.date === effectiveDate
     );
 
     const userDayPoints = userDayLedger.reduce((sum, e) => sum + e.points, 0);
     const partnerDayPoints = partnerDayLedger.reduce((sum, e) => sum + e.points, 0);
 
-    // Pending permission request for this day's task
-    const existingRequest = state.permissions.find(
-      p =>
-        p.entityId === task.id &&
-        p.requesterId === currentUser.id &&
-        p.status === 'PENDING'
-    ) || null;
-
-    // Can request approval if day is in past and task was missed or left pending
-    const canRequestApproval =
-      isPast &&
-      (!userTaskStatus ||
-        userTaskStatus.status === 'MISSED' ||
-        userTaskStatus.status === 'PENDING');
+    const sectionRows = await getRuntimePool().query(
+      `SELECT s.code AS section, tc.status AS "completionStatus",
+              tc.points_awarded AS "pointsAwarded", tc.completed_at AS "completedAt",
+              cr.external_id AS "requestId", cr.status AS "requestStatus",
+              cr.requester_participant_id = requester.id AS "isRequester"
+       FROM curriculum_tasks ct
+       JOIN subjects s ON s.id = ct.subject_id
+       JOIN participants requester ON requester.legacy_id = $1
+       LEFT JOIN task_completions tc ON tc.curriculum_task_id = ct.id AND tc.participant_id = requester.id
+       LEFT JOIN LATERAL (
+         SELECT cr.external_id, cr.status, cr.requester_participant_id
+         FROM change_requests cr
+         WHERE cr.target_id = ct.id
+           AND cr.target_type = 'RETROACTIVE_COMPLETION'
+           AND cr.requester_participant_id = requester.id
+         ORDER BY cr.created_at DESC
+         LIMIT 1
+       ) cr ON true
+       WHERE ct.legacy_id LIKE $2
+       ORDER BY s.code`,
+      [currentUser.id, `${task.id}-%`],
+    );
+    const completionSections = Object.fromEntries(sectionRows.rows.map((row: any) => {
+      const completed = row.completionStatus === 'COMPLETED_ON_TIME' || row.completionStatus === 'COMPLETED_LATE';
+      const requestStatus = row.requestStatus === 'APPLIED' ? 'COMPLETED' : row.requestStatus || 'NONE';
+      return [row.section, {
+        section: row.section,
+        status: completed ? 'COMPLETED' : requestStatus,
+        requestId: row.requestId || null,
+        pointsAwarded: Number(row.pointsAwarded || 0),
+        completedAt: row.completedAt || null,
+        canRequest: isPast && !completed && requestStatus === 'NONE',
+        canComplete: isCurrent || (isPast && !completed && requestStatus === 'APPROVED' && row.isRequester),
+      }];
+    }));
+    const existingRequest = completionSections.DSA?.status !== 'NONE'
+      ? completionSections.DSA
+      : null;
+    const canRequestApproval = Boolean(completionSections.DSA?.canRequest);
 
     res.json({
       dayNumber: dayNum,
-      date: task.date,
+      date: effectiveDate,
       isPast,
       isCurrent,
       isFuture,
       isLocked: isFuture,
-      currentDayNumber: dayInfo.dayNumber,
+      currentDayNumber: participantCurrentDayNumber,
       task,
       dsaProblem,
       currentUser: {
         id: currentUser.id,
         name: currentUser.name,
-        avatar: currentUser.avatar,
+        avatar: currentProfile.avatarUrl || currentUser.avatar,
         taskStatus: userTaskStatus?.status || (isPast ? 'MISSED' : 'PENDING'),
         completedAt: userTaskStatus?.completedAt,
         pointsAwarded: userTaskStatus?.pointsAwarded || 0,
@@ -1467,7 +1409,7 @@ apiRouter.get('/day/:day', async (req, res) => {
       partnerUser: {
         id: partnerUser.id,
         name: partnerUser.name,
-        avatar: partnerUser.avatar,
+        avatar: partnerProfile.avatarUrl || partnerUser.avatar,
         taskStatus: partnerTaskStatus?.status || (isPast ? 'MISSED' : 'PENDING'),
         completedAt: partnerTaskStatus?.completedAt,
         pointsAwarded: partnerTaskStatus?.pointsAwarded || 0,
@@ -1477,6 +1419,7 @@ apiRouter.get('/day/:day', async (req, res) => {
         dayPoints: partnerDayPoints,
         dayLedger: partnerDayLedger,
       },
+      completionSections,
       existingRequest,
       canRequestApproval,
       // Backward compatibility fields
@@ -1493,6 +1436,7 @@ apiRouter.post('/day/:day/request-approval', async (req, res) => {
   try {
     const dayNum = parseInt(req.params.day, 10);
     const { reason } = req.body;
+    const section = String(req.body?.section || 'DSA').toUpperCase();
     const currentUser = requireAuthUser(req, res);
     if (!currentUser) return;
     const state = store.getState();
@@ -1500,6 +1444,10 @@ apiRouter.post('/day/:day/request-approval', async (req, res) => {
 
     if (!reason || reason.trim().length < 5) {
       return res.status(400).json({ error: 'Please explain why you are requesting approval for this past task (min 5 characters).' });
+    }
+
+    if (!['DSA', 'JAVA', 'OS', 'DBMS'].includes(section)) {
+      return res.status(400).json({ error: 'Invalid curriculum section.' });
     }
 
     const task = state.tasks.find(t => t.dayNumber === dayNum);
@@ -1516,12 +1464,19 @@ apiRouter.post('/day/:day/request-approval', async (req, res) => {
       return res.status(400).json({ error: 'This task was already marked complete.' });
     }
 
-    // Create permission request
+    const sectionTask = (await getRuntimePool().query(
+      `SELECT ct.legacy_id, ct.title, cd.calendar_date::text AS date
+       FROM curriculum_tasks ct JOIN challenge_days cd ON cd.id = ct.challenge_day_id
+       WHERE ct.legacy_id = $1 LIMIT 1`,
+      [`${task.id}-${section}`],
+    )).rows[0];
+    if (!sectionTask) return res.status(404).json({ error: 'Task section not found in PostgreSQL.' });
+
     const request = await createPermissionRequest(
       currentUser.id,
       'RETROACTIVE_COMPLETION',
-      task.id,
-      `Day ${dayNum}: ${task.title}`,
+      `${task.id}::${section}`,
+      `${section} - ${sectionTask.title} (${sectionTask.date})`,
       reason.trim()
     );
 
@@ -1616,7 +1571,7 @@ apiRouter.get('/tasks/today', async (req, res) => {
   const state = store.getState();
   const dayInfo = calculateDayInfo();
 
-  const task = state.tasks.find(t => t.dayNumber === dayInfo.dayNumber);
+  const task = state.tasks.find(t => t.date === dayInfo.currentDate);
   if (!task) return res.status(404).json({ error: 'Today task not found' });
 
   const status = state.taskStatuses.find(
@@ -1706,7 +1661,16 @@ apiRouter.get('/dsa/today', async (req, res) => {
   if (!userId) return res.status(401).json({ error: 'Authentication required.' });
   try {
     const state = store.getState();
-    const problem = state.dsaProblems.find((item) => item.dayNumber === calculateDayInfo().dayNumber);
+    const currentDate = calculateDayInfo().currentDate;
+    const challenge = (await getRuntimePool().query(
+      `SELECT challenge_id AS "challengeId" FROM dsa_problems WHERE legacy_id = $1 LIMIT 1`,
+      [state.dsaProblems[0]?.id],
+    )).rows[0];
+    const effectiveDates = challenge
+      ? await getParticipantEffectiveDates(getRuntimePool(), userId, challenge.challengeId)
+      : new Map<number, string>();
+    const currentDay = Array.from(effectiveDates.entries()).find(([, date]) => date === currentDate)?.[0];
+    const problem = state.dsaProblems.find((item) => item.dayNumber === currentDay);
     if (!problem) return res.status(404).json({ error: 'No DSA problem found for today' });
     const attempt = await getDsaAttempt(getRuntimePool(), userId, problem.id);
     return res.json({ problem, attempt, isSolved: attempt?.status === 'SOLVED' });
@@ -1762,7 +1726,7 @@ apiRouter.get('/legacy/dsa/today', (req, res) => {
   const state = store.getState();
   const dayInfo = calculateDayInfo();
 
-  const problem = state.dsaProblems.find(p => p.dayNumber === dayInfo.dayNumber);
+  const problem = state.dsaProblems.find(p => p.date === dayInfo.currentDate);
   if (!problem) return res.status(404).json({ error: 'No DSA problem found for today' });
 
   const attempt = state.dsaAttempts.find(
@@ -1864,20 +1828,16 @@ apiRouter.post('/legacy/dsa/attempt', async (req, res) => {
 // ----------------------------------------------------------------------
 const handleGetLedger = (req: any, res: any) => {
   const state = store.getState();
-  const { userId, eventType } = req.query;
+  const { eventType } = req.query;
 
-  let entries = [...state.pointLedger];
-
-  if (userId) {
-    entries = entries.filter(e => e.userId === userId);
-  }
+  const competitionUserIds = new Set(['user-rahul', 'user-dileep']);
+  let entries = state.pointLedger.filter((entry: any) => competitionUserIds.has(entry.userId));
 
   if (eventType) {
-    entries = entries.filter(e => e.eventType === eventType);
+    entries = entries.filter((e: any) => e.eventType === eventType);
   }
 
-  // Sort descending by timestamp
-  entries.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  entries.sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
   res.json({
     totalEntries: entries.length,
@@ -1952,7 +1912,8 @@ apiRouter.get('/habits', async (req, res, next) => {
   try {
     const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1];
     const result = await getHabitData(getRuntimePool(), userId, partner.id);
-    return res.json({ myStats: result.myStats, partnerStreak: result.partnerStats.currentStreak, partnerCleanDays: result.partnerStats.totalCleanDays, partnerName: partner.name, habitLeaderName: result.myStats.currentStreak >= result.partnerStats.currentStreak ? 'Tied' : partner.name, diffDays: Math.abs(result.myStats.currentStreak - result.partnerStats.currentStreak), comparisonText: 'Self-control streak comparison.', todayRecorded: Boolean(result.today), todayStatus: result.today?.status || null, history: result.history });
+    const habitLeaderName = result.myStats.currentStreak === result.partnerStats.currentStreak ? null : result.myStats.currentStreak > result.partnerStats.currentStreak ? userId === 'user-rahul' ? 'Rahul' : 'Dileep' : partner.name;
+    return res.json({ myStats: result.myStats, partnerStreak: result.partnerStats.currentStreak, partnerBestStreak: result.partnerStats.bestStreak, partnerCleanDays: result.partnerStats.totalCleanDays, partnerName: partner.name, habitLeaderName, diffDays: Math.abs(result.myStats.currentStreak - result.partnerStats.currentStreak), comparisonText: habitLeaderName ? `${habitLeaderName} leads the self-control streak.` : 'Self-control streaks are tied.', todayRecorded: Boolean(result.today), todayStatus: result.today?.status || null, history: result.history });
   } catch (error) { return next(error); }
 });
 apiRouter.get('/habit', (_req, res) => res.redirect(307, '/api/habits'));
@@ -2088,12 +2049,12 @@ const handleGetJournal = (req: any, res: any) => {
 
 apiRouter.get('/journal/today', async (req, res) => {
   const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
-  try { const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1]; const date = (req.query.date as string) || calculateDayInfo().currentDate; const result = await getJournalData(getRuntimePool(), userId, partner.id, date); return res.json({ ...result, journalStatus: 'OPEN', journalDate: result.journal.date, currentServerTime: getISTNow().toISOString(), isLocked: false }); }
+  try { const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1]; const date = (req.query.date as string) || calculateDayInfo().currentDate; const result = await getJournalData(getRuntimePool(), userId, partner.id, date); const isLocked = result.journal.status !== 'OPEN'; return res.json({ ...result, journalStatus: result.journal.status, journalDate: result.journal.date, currentServerTime: getISTNow().toISOString(), isLocked }); }
   catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
 });
 apiRouter.get('/journal', async (req, res) => {
   const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
-  try { const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1]; const date = (req.query.date as string) || calculateDayInfo().currentDate; const result = await getJournalData(getRuntimePool(), userId, partner.id, date); return res.json({ ...result, journalStatus: 'OPEN', journalDate: result.journal.date, currentServerTime: getISTNow().toISOString(), isLocked: false }); }
+  try { const state = store.getState(); const partner = state.users.find((user) => user.id !== userId) || state.users[1]; const date = (req.query.date as string) || calculateDayInfo().currentDate; const result = await getJournalData(getRuntimePool(), userId, partner.id, date); const isLocked = result.journal.status !== 'OPEN'; return res.json({ ...result, journalStatus: result.journal.status, journalDate: result.journal.date, currentServerTime: getISTNow().toISOString(), isLocked }); }
   catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
 });
 
@@ -2152,8 +2113,28 @@ apiRouter.post('/legacy/todays-live/:id/focused-execution/finalize', (req, res) 
 
 apiRouter.post('/journal', async (req, res) => {
   const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
-  try { const date = req.body.date || calculateDayInfo().currentDate; const journal = await saveJournal(getRuntimePool(), userId, date, req.body); return res.json({ success: true, message: 'Today\'s Live saved securely.', journal, journalDate: journal.date, journalStatus: journal.status, isLocked: false }); }
+  try { const date = req.body.date || calculateDayInfo().currentDate; const journal = await saveJournal(getRuntimePool(), userId, date, req.body); return res.json({ success: true, message: 'Today\'s Live saved securely and locked.', journal, journalDate: journal.date, journalStatus: journal.status, isLocked: true }); }
   catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : 500; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
+});
+
+apiRouter.post('/journal/reset-request', async (req, res) => {
+  const userId = getSessionUserId(req); if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+  const date = typeof req.body?.date === 'string' ? req.body.date : calculateDayInfo().currentDate;
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+  if (reason.length < 5) return res.status(400).json({ error: 'Please provide a clear reason for requesting an entry reset.' });
+  try {
+    const row = await getRuntimePool().query(
+      `SELECT tl.id, tl.status FROM todays_live tl JOIN participants p ON p.id = tl.participant_id JOIN challenge_days cd ON cd.id = tl.challenge_day_id WHERE p.legacy_id = $1 AND cd.calendar_date = $2`,
+      [userId, date]
+    );
+    if (row.rowCount !== 1) return res.status(404).json({ error: 'Daily entry not found.' });
+    if (row.rows[0].status === 'OPEN') return res.status(400).json({ error: 'This daily entry is already unlocked.' });
+    const state = store.getState();
+    const partner = state.users.find(user => user.id !== userId);
+    if (!partner) return res.status(404).json({ error: 'Partner not found.' });
+    const request = await createPermissionRequest(userId, 'RESET_ENTRY', row.rows[0].id, `Daily entry: ${date}`, reason, { entityType: 'STUDY_SCHEDULE', oldValue: 'LOCKED', proposedValue: 'OPEN' });
+    return res.json({ success: true, message: 'Reset request sent to your partner for approval.', request });
+  } catch (error) { const statusCode = error instanceof HabitJournalError ? error.statusCode : (error as { statusCode?: number })?.statusCode || 400; return res.status(statusCode).json({ error: error instanceof Error ? error.message : String(error) }); }
 });
 
 apiRouter.post('/legacy/journal', async (req, res) => {
@@ -2369,12 +2350,22 @@ apiRouter.get('/permissions', async (req, res) => {
 
   try {
     const result = await getRuntimePool().query(
-      `SELECT cr.external_id AS id, requester.legacy_id AS "requesterId", requester.display_name AS "requesterName", target.legacy_id AS "targetUserId", target.display_name AS "targetUserName", cr.target_type AS "actionType", cr.external_target_id AS "entityId", cr.reason, cr.status, cr.created_at AS "createdAt", cr.responded_at AS "respondedAt", cr.applied_at AS "appliedAt", cr.old_value AS "oldValue", cr.proposed_value AS "proposedValue"
+      `SELECT cr.external_id AS id, requester.legacy_id AS "requesterId", requester.display_name AS "requesterName", target.legacy_id AS "targetUserId", target.display_name AS "targetUserName", cr.target_type AS "actionType", cr.external_target_id AS "entityId", cr.target_id AS "targetRecordId", targetTask.legacy_id AS "targetTaskLegacyId", targetSubject.code AS "targetSection", cr.reason, cr.status, cr.created_at AS "createdAt", cr.responded_at AS "respondedAt", cr.applied_at AS "appliedAt", cr.old_value AS "oldValue", cr.proposed_value AS "proposedValue"
        FROM change_requests cr JOIN participants requester ON requester.id=cr.requester_participant_id JOIN participants target ON target.id=cr.target_participant_id
+       LEFT JOIN curriculum_tasks targetTask ON targetTask.id=cr.target_id
+       LEFT JOIN subjects targetSubject ON targetSubject.id=targetTask.subject_id
        WHERE requester.legacy_id=$1 OR target.legacy_id=$1 ORDER BY cr.created_at DESC`, [currentUser.id]
     );
-    const requests = result.rows.map((row: any) => ({ ...row, entityTitle: row.entityId || row.actionType }));
-    return res.json({ pendingForMe: requests.filter((request: any) => request.targetUserId === currentUser.id && request.status === 'PENDING'), myRequests: requests.filter((request: any) => request.requesterId === currentUser.id), all: requests });
+    const requests = result.rows.map((row: any) => ({
+      ...row,
+      entityId: row.actionType === 'RETROACTIVE_COMPLETION' && !String(row.entityId || '').includes('::') && row.targetTaskLegacyId && row.targetSection
+        ? `${String(row.targetTaskLegacyId).replace(/-(DSA|JAVA|OS|DBMS)$/, '')}::${row.targetSection}`
+        : row.entityId,
+      entityTitle: row.entityId || row.actionType,
+    }));
+    const pendingForMe = requests.filter((request: any) => request.targetUserId === currentUser.id && request.status === 'PENDING');
+    const myRequests = requests.filter((request: any) => request.requesterId === currentUser.id);
+    return res.json({ pendingForMe, myRequests, allRequests: requests, all: requests });
   } catch (error) { return res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
 });
 

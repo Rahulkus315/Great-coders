@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildUserExport } from '../server/routes.ts';
+import { listLedger } from '../server/notificationService.ts';
 
 test('user export omits credentials and another participant private data', () => {
   const state: any = {
@@ -24,16 +25,53 @@ test('user export omits credentials and another participant private data', () =>
   assert.deepEqual(exported.pointLedger, [{ userId: 'user-rahul' }]);
 });
 
+test('competition-wide ledger query includes both Rahul and Dileep rather than filtering to the current session user', async () => {
+  const rows = [
+    { id: 'l1', userId: 'user-rahul', eventType: 'TASK_COMPLETED_ON_TIME', points: 4, reason: 'Rahul completed DSA task', timestamp: '2026-09-17T08:00:00Z', date: '2026-09-17', runningTotal: 4 },
+    { id: 'l2', userId: 'user-dileep', eventType: 'DSA_COMPLETED', points: 3, reason: 'Dileep solved DSA problem', timestamp: '2026-09-17T09:00:00Z', date: '2026-09-17', runningTotal: 3 },
+  ];
+  const calls: Array<{ sql: string; params: any[] }> = [];
+  const pool = {
+    query: async (sql: string, params: any[] = []) => {
+      calls.push({ sql, params });
+      return { rows };
+    },
+  } as any;
+
+  const result = await listLedger(pool, 'user-rahul');
+  assert.deepEqual(result.map((entry: any) => entry.userId).sort(), ['user-dileep', 'user-rahul']);
+  assert.match(calls[0].sql, /legacy_id\s*=\s*ANY\(\$1\)|legacy_id\s*=\s*ANY/i);
+  assert.doesNotMatch(calls[0].sql, /p\.legacy_id\s*=\s*\$1/i);
+});
+
+test('both Rahul and Dileep see the same competition-wide ledger data without duplicates or unrelated leaks', async () => {
+  const rows = [
+    { id: 'r1', userId: 'user-rahul', eventType: 'TASK_COMPLETED_ON_TIME', points: 4, reason: 'Rahul DSA task', timestamp: '2026-09-17T08:00:00Z', date: '2026-09-17' },
+    { id: 'd1', userId: 'user-dileep', eventType: 'DSA_COMPLETED', points: 3, reason: 'Dileep DSA task', timestamp: '2026-09-17T09:00:00Z', date: '2026-09-17' },
+  ];
+  const pool = { query: async (_sql: string, params: any[] = []) => ({ rows: rows.filter((row) => ['user-rahul', 'user-dileep'].includes(row.userId) && params[0]?.includes?.(row.userId) !== false) }) } as any;
+
+  const result = await listLedger(pool, 'user-rahul');
+  const userIds = result.map((entry: any) => entry.userId);
+  assert.deepEqual([...new Set(userIds)], ['user-rahul', 'user-dileep']);
+  assert.equal(userIds.filter((id: string) => id === 'user-rahul').length, 1);
+  assert.equal(userIds.filter((id: string) => id === 'user-dileep').length, 1);
+  assert.equal(userIds.includes('user-other'), false);
+  assert.equal(result.length, 2);
+});
+
 test('administrative HTTP routes are not present in the router source', async () => {
   const fs = await import('node:fs/promises');
   const source = await fs.readFile(new URL('../server/routes.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /apiRouter\.post\(['"]\/(?:system\/reset-stats|admin\/reset|settlement\/trigger)/);
 });
 
-test('runtime store is no longer file-backed through app_state.json', async () => {
+test('runtime store is PostgreSQL-backed and TLS verification remains enabled', async () => {
   const fs = await import('node:fs/promises');
   const source = await fs.readFile(new URL('../server/store.ts', import.meta.url), 'utf8');
-  assert.doesNotMatch(source, /app_state\.json|STATE_FILE|readFileSync|writeFileSync/);
+  assert.doesNotMatch(source, /app_state\.json|STATE_FILE|writeFileSync/);
+  assert.match(source, /rejectUnauthorized:\s*true/);
+  assert.doesNotMatch(source, /rejectUnauthorized:\s*false/);
 });
 
 test('task completion flow no longer mutations the legacy in-memory task ledger', async () => {

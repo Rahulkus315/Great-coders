@@ -73,7 +73,7 @@ export function calculateDayInfo(): DayInfo {
     morningWindowStatus = 'CLOSED';
   }
 
-  // Calculate day difference from challenge start date (2026-09-15)
+  // Calculate day difference from challenge start date (2026-09-17)
   const startParts = CHALLENGE_START_DATE.split('-').map(Number);
   const currentParts = currentDate.split('-').map(Number);
 

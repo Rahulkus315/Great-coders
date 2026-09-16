@@ -15,8 +15,8 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 const db = process.env.DATABASE_URL || 'postgres://localhost/great_coders_migration_dev';
-const challengeStart = '2026-09-15';
-const challengeEnd = '2026-12-31';
+const challengeStart = '2026-09-17';
+const challengeEnd = '2026-12-25';
 const timezone = 'Asia/Kolkata';
 
 function addDays(date: string, days: number) {

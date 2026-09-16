@@ -18,10 +18,10 @@ interface TodayTasksProps {
 }
 
 const SECTION_CONFIG: Record<ScheduleSection, { label: string; points: number; icon: React.ReactNode; color: string }> = {
-  DSA: { label: 'DSA', points: 10, icon: <Code2 className="w-5 h-5" />, color: 'cyan' },
-  JAVA: { label: 'Java', points: 10, icon: <Coffee className="w-5 h-5" />, color: 'amber' },
-  OS: { label: 'Operating Systems (OS)', points: 8, icon: <Server className="w-5 h-5" />, color: 'violet' },
-  DBMS: { label: 'DBMS', points: 8, icon: <Database className="w-5 h-5" />, color: 'emerald' },
+  DSA: { label: 'DSA', points: 3, icon: <Code2 className="w-5 h-5" />, color: 'cyan' },
+  JAVA: { label: 'Java', points: 2, icon: <Coffee className="w-5 h-5" />, color: 'amber' },
+  OS: { label: 'Operating Systems (OS)', points: 1, icon: <Server className="w-5 h-5" />, color: 'violet' },
+  DBMS: { label: 'DBMS', points: 1, icon: <Database className="w-5 h-5" />, color: 'emerald' },
 };
 
 const sectionOrder: ScheduleSection[] = ['DSA', 'JAVA', 'OS', 'DBMS'];
@@ -147,7 +147,7 @@ export const TodayTasks: React.FC<TodayTasksProps> = ({
                     </button>
                   </div>
                 ) : missed ? (
-                  <span className="text-xs font-bold text-rose-300">Missed settlement (-5 pts)</span>
+                  <span className="text-xs font-bold text-rose-300">Missed settlement ({section === 'DSA' ? '-5' : section === 'JAVA' || section === 'DBMS' ? '-2' : '-1'} pts)</span>
                 ) : isNightLockdown ? (
                   <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-purple-300"><Moon className="w-3.5 h-3.5" /> Locked until 04:00</span>
                 ) : (

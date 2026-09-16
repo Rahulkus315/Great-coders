@@ -15,11 +15,12 @@ import {
   Sun,
   History,
 } from 'lucide-react';
-import { User, DayInfo, AppNotification } from '../types';
+import { User, DayInfo, AppNotification, ProfileSettings } from '../types';
 
 interface NavbarProps {
   currentUser: User;
   partnerUser: User;
+  currentProfile: ProfileSettings;
   dayInfo: DayInfo;
   notifications: AppNotification[];
   remainingLeaves?: number;
@@ -32,6 +33,7 @@ interface NavbarProps {
 export const Navbar: React.FC<NavbarProps> = ({
   currentUser,
   partnerUser,
+  currentProfile,
   dayInfo,
   notifications,
   remainingLeaves = 5,
@@ -222,7 +224,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 className="flex items-center space-x-1.5 sm:space-x-2.5 p-1 sm:p-1.5 pr-1.5 sm:pr-3 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 transition-colors cursor-pointer min-h-[36px]"
               >
                 <img
-                  src={currentUser.avatar}
+                  src={currentProfile.avatarUrl || currentUser.avatar}
                   alt={currentUser.name}
                   className="w-6 h-6 sm:w-7 sm:h-7 rounded-full object-cover ring-1 ring-indigo-500/50"
                 />
@@ -254,7 +256,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                     <div className="p-2.5 rounded-lg bg-indigo-500/10 border border-indigo-500/30 text-xs">
                       <div className="flex items-center space-x-2.5">
                         <img
-                          src={currentUser.avatar}
+                          src={currentProfile.avatarUrl || currentUser.avatar}
                           alt={currentUser.name}
                           className="w-9 h-9 rounded-full object-cover ring-2 ring-indigo-500/40"
                         />
