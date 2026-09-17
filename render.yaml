@@ -18,5 +18,9 @@ services:
         value: require
       - key: DATABASE_URL
         sync: false
+      - key: APP_ORIGIN
+        value: https://great-coders.onrender.com
+      - key: APP_BASE_URL
+        value: https://great-coders.onrender.com
       - key: SUPABASE_CA_CERT
         sync: false

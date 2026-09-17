@@ -3,6 +3,7 @@ import path from 'path';
 import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
 import { createServer as createViteServer } from 'vite';
+import { initializeProductionCredentials } from './scripts/initialize-production-credentials';
 import { apiRouter } from './server/routes';
 import { getRuntimePool, store } from './server/store';
 import { runMidnightSettlement, settleMorningCheckinsForDate } from './server/settlementEngine';
@@ -12,6 +13,10 @@ dotenv.config();
 
 async function startServer() {
   await store.initialize();
+
+  if (process.env.NODE_ENV === 'production' && process.env.PRODUCTION_CREDENTIAL_INIT === 'true') {
+    await initializeProductionCredentials();
+  }
 
   const app = express();
   const PORT = Number(process.env.PORT || 3000);

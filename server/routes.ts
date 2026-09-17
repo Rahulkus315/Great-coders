@@ -85,12 +85,59 @@ export const apiRouter = express.Router();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
+function normalizeOrigin(value: string | undefined) {
+  if (!value) return '';
+
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return trimmed.replace(/\/+$/, '');
+  }
+}
+
+function getAllowedRequestOrigins() {
+  const configured = [
+    ...(process.env.APP_ORIGIN || '').split(',').map(value => value.trim()),
+    ...(process.env.APP_BASE_URL || '').split(',').map(value => value.trim()),
+  ].filter(Boolean).map(normalizeOrigin).filter(Boolean);
+
+  const localhostDefaults = ['http://localhost:3000', 'http://0.0.0.0:3000', 'http://localhost:5173'];
+  const productionDefaults = ['https://great-coders.onrender.com'];
+
+  return new Set(configured.length ? configured : process.env.NODE_ENV === 'production' ? productionDefaults : localhostDefaults);
+}
+
 function isAllowedRequestOrigin(req: express.Request) {
-  const origin = req.get('origin') || (req.get('referer') ? new URL(req.get('referer')!).origin : '');
-  if (!origin) return process.env.NODE_ENV !== 'production';
-  const configured = (process.env.APP_ORIGIN || '').split(',').map(value => value.trim()).filter(Boolean);
-  const allowed = new Set(configured.length ? configured : ['http://localhost:3000', 'http://0.0.0.0:3000', 'http://localhost:5173']);
-  return allowed.has(origin);
+  const originHeader = normalizeOrigin(req.get('origin') || undefined);
+  if (originHeader) {
+    return getAllowedRequestOrigins().has(originHeader);
+  }
+
+  const refererHeader = req.get('referer');
+  if (refererHeader) {
+    try {
+      const refererOrigin = normalizeOrigin(new URL(refererHeader).origin);
+      return refererOrigin ? getAllowedRequestOrigins().has(refererOrigin) : false;
+    } catch {
+      return false;
+    }
+  }
+
+  if (process.env.NODE_ENV !== 'production') {
+    return true;
+  }
+
+  const forwardedHost = req.get('x-forwarded-host');
+  const forwardedProto = req.get('x-forwarded-proto');
+  if (forwardedHost && forwardedProto) {
+    const forwardedOrigin = normalizeOrigin(`${forwardedProto}://${forwardedHost}`);
+    return forwardedOrigin ? getAllowedRequestOrigins().has(forwardedOrigin) : false;
+  }
+
+  return false;
 }
 
 apiRouter.use((req, res, next) => {
