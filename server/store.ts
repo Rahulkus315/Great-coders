@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import { Pool } from 'pg';
 import {
   User,
@@ -21,6 +20,7 @@ import {
 } from '../src/types';
 import { generateCurriculum, MOTIVATION_QUOTES } from './curriculumData';
 import { ensureParticipantSchedules } from './participantScheduleService';
+import { buildConnectionString, buildPostgresSslConfig } from './postgresConfig';
 
 let runtimePool: Pool | null = null;
 
@@ -31,25 +31,8 @@ export function getRuntimePool(env = process.env): Pool {
   }
 
   if (!runtimePool) {
-    const localDatabaseUrl = new URL(databaseUrl);
-    localDatabaseUrl.searchParams.delete('sslmode');
-    const connectionString = localDatabaseUrl.toString();
-    const sslRequired = env.PGSSLMODE === 'require' || connectionString.includes('pooler.supabase.com');
-    const sslConfig = sslRequired ? (() => {
-      if (env.SUPABASE_CA_CERT) {
-        return { rejectUnauthorized: true, ca: env.SUPABASE_CA_CERT };
-      }
-
-      if (env.PGSSLROOTCERT) {
-        try {
-          return { rejectUnauthorized: true, ca: fs.readFileSync(env.PGSSLROOTCERT, 'utf8') };
-        } catch {
-          return { rejectUnauthorized: true };
-        }
-      }
-
-      return { rejectUnauthorized: true };
-    })() : undefined;
+    const connectionString = buildConnectionString(databaseUrl);
+    const sslConfig = buildPostgresSslConfig(env, new URL(connectionString).hostname);
 
     runtimePool = new Pool({
       connectionString,

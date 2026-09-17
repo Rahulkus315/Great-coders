@@ -1,6 +1,6 @@
-import fs from 'node:fs';
 import dotenv from 'dotenv';
 import { Pool, PoolClient } from 'pg';
+import { buildConnectionString, buildPostgresSslConfig } from '../server/postgresConfig';
 
 dotenv.config();
 
@@ -34,31 +34,7 @@ function isProductionDatabaseHost(hostname: string) {
 }
 
 function getSslConfig(env: NodeJS.ProcessEnv) {
-  const databaseUrl = env.DATABASE_URL || '';
-  if (!databaseUrl) {
-    return undefined;
-  }
-
-  const connectionString = new URL(databaseUrl);
-  const sslRequired = env.PGSSLMODE === 'require' || connectionString.hostname.includes('pooler.') || connectionString.hostname.includes('supabase.');
-
-  if (!sslRequired) {
-    return undefined;
-  }
-
-  if (env.SUPABASE_CA_CERT) {
-    return { rejectUnauthorized: true, ca: env.SUPABASE_CA_CERT };
-  }
-
-  if (env.PGSSLROOTCERT) {
-    try {
-      return { rejectUnauthorized: true, ca: fs.readFileSync(env.PGSSLROOTCERT, 'utf8') };
-    } catch {
-      return { rejectUnauthorized: true };
-    }
-  }
-
-  return { rejectUnauthorized: true };
+  return buildPostgresSslConfig(env, env.DATABASE_URL ? new URL(env.DATABASE_URL).hostname : undefined);
 }
 
 async function assertProductionGuard(client: PoolClient) {
@@ -134,9 +110,10 @@ export async function initializeProductionCredentials(): Promise<void> {
     throw new Error('Refusing to initialize credentials: DATABASE_URL is not a verified production database target.');
   }
 
+  const connectionString = buildConnectionString(databaseUrl);
   const sslConfig = getSslConfig(process.env);
   const pool = new Pool({
-    connectionString: databaseUrl,
+    connectionString,
     ...(sslConfig ? { ssl: sslConfig } : {}),
   });
 
