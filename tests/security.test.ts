@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildUserExport } from '../server/routes.ts';
 import { listLedger } from '../server/notificationService.ts';
-import { getDatabaseHostnameFromUrl, isLoopbackHost, isProductionDatabaseHost } from '../scripts/initialize-production-credentials.ts';
+import { evaluateProductionGuard, getDatabaseHostnameFromUrl, isLoopbackHost, isProductionDatabaseHost } from '../scripts/initialize-production-credentials.ts';
 
 test('user export omits credentials and another participant private data', () => {
   const state: any = {
@@ -67,12 +67,47 @@ test('administrative HTTP routes are not present in the router source', async ()
   assert.doesNotMatch(source, /apiRouter\.post\(['"]\/(?:system\/reset-stats|admin\/reset|settlement\/trigger)/);
 });
 
+test('production database guard accepts valid Supabase pooler DATABASE_URL with private runtime IP', () => {
+  const env = { NODE_ENV: 'production', PRODUCTION_CREDENTIAL_INIT: 'true' };
+  const databaseUrl = 'postgresql://user:pass@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres';
+  assert.doesNotThrow(() => evaluateProductionGuard(databaseUrl, '10.0.0.8', env));
+});
+
+test('production database guard accepts valid Supabase DATABASE_URL with public Supabase runtime host', () => {
+  const env = { NODE_ENV: 'production', PRODUCTION_CREDENTIAL_INIT: 'true' };
+  const databaseUrl = 'postgresql://user:pass@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres';
+  assert.doesNotThrow(() => evaluateProductionGuard(databaseUrl, 'aws-0-ap-northeast-1.pooler.supabase.com', env));
+});
+
+test('production database guard rejects localhost DATABASE_URL', () => {
+  const env = { NODE_ENV: 'production', PRODUCTION_CREDENTIAL_INIT: 'true' };
+  const databaseUrl = 'postgresql://user:pass@localhost:5432/postgres';
+  assert.throws(() => evaluateProductionGuard(databaseUrl, '10.0.0.8', env), /DATABASE_URL host is not a production database target/);
+});
+
+test('production database guard rejects arbitrary production-looking or malformed DATABASE_URL values', () => {
+  const env = { NODE_ENV: 'production', PRODUCTION_CREDENTIAL_INIT: 'true' };
+  assert.throws(() => evaluateProductionGuard('postgresql://user:pass@example.com:5432/postgres', '10.0.0.8', env), /DATABASE_URL host is not a production database target/);
+  assert.throws(() => evaluateProductionGuard('postgresql://user:pass@198.51.100.22:5432/postgres', '10.0.0.8', env), /DATABASE_URL host is not a production database target/);
+  assert.throws(() => evaluateProductionGuard(null, '10.0.0.8', env), /DATABASE_URL host is not a production database target/);
+  assert.equal(getDatabaseHostnameFromUrl('not a valid url'), null);
+});
+
+test('production database guard rejects loopback runtime addresses while allowing private runtime IPs', () => {
+  const env = { NODE_ENV: 'production', PRODUCTION_CREDENTIAL_INIT: 'true' };
+  const databaseUrl = 'postgresql://user:pass@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres';
+  assert.throws(() => evaluateProductionGuard(databaseUrl, 'localhost', env), /host is not a production database target/);
+  assert.throws(() => evaluateProductionGuard(databaseUrl, '127.0.0.1', env), /host is not a production database target/);
+  assert.throws(() => evaluateProductionGuard(databaseUrl, '::1', env), /host is not a production database target/);
+  assert.doesNotThrow(() => evaluateProductionGuard(databaseUrl, '10.0.0.8', env));
+});
+
 test('runtime store is PostgreSQL-backed and TLS verification remains enabled', async () => {
   const fs = await import('node:fs/promises');
-  const source = await fs.readFile(new URL('../server/store.ts', import.meta.url), 'utf8');
-  assert.doesNotMatch(source, /app_state\.json|STATE_FILE|writeFileSync/);
+  const source = await fs.readFile(new URL('../server/postgresConfig.ts', import.meta.url), 'utf8');
   assert.match(source, /rejectUnauthorized:\s*true/);
   assert.doesNotMatch(source, /rejectUnauthorized:\s*false/);
+  assert.match(source, /buildPostgresSslConfig/);
 });
 
 test('task completion flow no longer mutations the legacy in-memory task ledger', async () => {

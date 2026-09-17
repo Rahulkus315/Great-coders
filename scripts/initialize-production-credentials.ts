@@ -52,6 +52,27 @@ function getSslConfig(env: NodeJS.ProcessEnv) {
   return buildPostgresSslConfig(env, env.DATABASE_URL ? new URL(env.DATABASE_URL).hostname : undefined);
 }
 
+export function evaluateProductionGuard(configuredDatabaseUrl: string | null | undefined, runtimeHostValue: string | undefined, env: NodeJS.ProcessEnv = process.env) {
+  const configuredHost = getDatabaseHostnameFromUrl(configuredDatabaseUrl || undefined);
+  const runtimeHost = getRuntimeHost(runtimeHostValue);
+
+  if (!configuredHost || !isProductionDatabaseHost(configuredHost)) {
+    throw new Error('Production database guard failed: DATABASE_URL host is not a production database target.');
+  }
+
+  if (runtimeHost && isLoopbackHost(runtimeHost)) {
+    throw new Error('Production database guard failed: host is not a production database target.');
+  }
+
+  if (env.NODE_ENV !== 'production') {
+    throw new Error('Production credential initialization is only allowed when NODE_ENV=production.');
+  }
+
+  if (env.PRODUCTION_CREDENTIAL_INIT !== 'true') {
+    throw new Error('Production credential initialization can only run when PRODUCTION_CREDENTIAL_INIT=true.');
+  }
+}
+
 async function assertProductionGuard(client: PoolClient) {
   const result = await client.query<{
     current_database: string;
@@ -69,32 +90,11 @@ async function assertProductionGuard(client: PoolClient) {
     throw new Error('Database identity lookup failed.');
   }
 
-  const configuredHost = getDatabaseHostnameFromUrl(process.env.DATABASE_URL || undefined);
-  const runtimeHost = getRuntimeHost(row.db_host || '');
-
-  if (!configuredHost || !isProductionDatabaseHost(configuredHost)) {
-    throw new Error('Production database guard failed: DATABASE_URL host is not a production database target.');
-  }
-
-  if (runtimeHost && isLoopbackHost(runtimeHost)) {
-    throw new Error('Production database guard failed: host is not a production database target.');
-  }
-
-  if (runtimeHost && !isProductionDatabaseHost(runtimeHost) && runtimeHost !== configuredHost) {
-    throw new Error('Production database guard failed: host is not a production database target.');
-  }
-
-  if (process.env.NODE_ENV !== 'production') {
-    throw new Error('Production credential initialization is only allowed when NODE_ENV=production.');
-  }
-
-  if (process.env.PRODUCTION_CREDENTIAL_INIT !== 'true') {
-    throw new Error('Production credential initialization can only run when PRODUCTION_CREDENTIAL_INIT=true.');
-  }
+  evaluateProductionGuard(process.env.DATABASE_URL || undefined, row.db_host || undefined, process.env);
 
   return {
     database: row.current_database,
-    host,
+    host: row.db_host,
     version: row.server_version,
   };
 }
