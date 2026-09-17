@@ -19,18 +19,33 @@ const REQUIRED_PARTICIPANTS = [
 ] as const;
 
 function getRuntimeHost(hostname: string | undefined) {
-  return (hostname || '').toLowerCase();
+  return (hostname || '').trim().toLowerCase();
 }
 
-function isLoopbackHost(hostname: string) {
-  const host = hostname.toLowerCase();
-  return host === 'localhost' || host === '127.0.0.1' || host.startsWith('localhost.') || host.startsWith('127.0.0.1.');
+export function getDatabaseHostnameFromUrl(databaseUrl: string | undefined) {
+  if (!databaseUrl) return null;
+
+  try {
+    return new URL(databaseUrl).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
 }
 
-function isProductionDatabaseHost(hostname: string) {
-  const host = hostname.toLowerCase();
+export function isLoopbackHost(hostname: string) {
+  const host = getRuntimeHost(hostname);
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.startsWith('localhost.') || host.startsWith('127.0.0.1.') || host.startsWith('[::1]');
+}
+
+export function isProductionDatabaseHost(hostname: string) {
+  const host = getRuntimeHost(hostname);
   if (!host || isLoopbackHost(host)) return false;
-  return host.includes('render') || host.includes('supabase') || host.includes('pooler') || host.includes('prod') || host.includes('production');
+
+  if (host.includes('localhost') || host.includes('127.0.0.1') || host === '::1') return false;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return false;
+  if (/^\[::1\]$/i.test(host)) return false;
+
+  return host.endsWith('.supabase.co') || host.endsWith('.supabase.com') || host.includes('.pooler.supabase.com');
 }
 
 function getSslConfig(env: NodeJS.ProcessEnv) {
@@ -54,8 +69,18 @@ async function assertProductionGuard(client: PoolClient) {
     throw new Error('Database identity lookup failed.');
   }
 
-  const host = getRuntimeHost(row.db_host || '');
-  if (!host || !isProductionDatabaseHost(host)) {
+  const configuredHost = getDatabaseHostnameFromUrl(process.env.DATABASE_URL || undefined);
+  const runtimeHost = getRuntimeHost(row.db_host || '');
+
+  if (!configuredHost || !isProductionDatabaseHost(configuredHost)) {
+    throw new Error('Production database guard failed: DATABASE_URL host is not a production database target.');
+  }
+
+  if (runtimeHost && isLoopbackHost(runtimeHost)) {
+    throw new Error('Production database guard failed: host is not a production database target.');
+  }
+
+  if (runtimeHost && !isProductionDatabaseHost(runtimeHost) && runtimeHost !== configuredHost) {
     throw new Error('Production database guard failed: host is not a production database target.');
   }
 
@@ -104,8 +129,7 @@ export async function initializeProductionCredentials(): Promise<void> {
     throw new Error('Missing required environment variable: DATABASE_URL');
   }
 
-  const url = new URL(databaseUrl);
-  const host = getRuntimeHost(url.hostname);
+  const host = getDatabaseHostnameFromUrl(databaseUrl);
   if (!host || !isProductionDatabaseHost(host)) {
     throw new Error('Refusing to initialize credentials: DATABASE_URL is not a verified production database target.');
   }

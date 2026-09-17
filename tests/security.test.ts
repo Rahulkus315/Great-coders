@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildUserExport } from '../server/routes.ts';
 import { listLedger } from '../server/notificationService.ts';
+import { getDatabaseHostnameFromUrl, isLoopbackHost, isProductionDatabaseHost } from '../scripts/initialize-production-credentials.ts';
 
 test('user export omits credentials and another participant private data', () => {
   const state: any = {
@@ -109,6 +110,22 @@ test('approval requests and responses no longer mutate the legacy runtime_state 
   assert.doesNotMatch(permissionSource, /state\.permissions\.unshift|state\.notifications\.unshift|state\.auditLogs\.unshift/);
   assert.doesNotMatch(permissionSource, /Object\.assign\(req|Object\.assign\(target/);
   assert.doesNotMatch(storeSource, /INSERT INTO runtime_state \(name, state_json, updated_at\)|ON CONFLICT \(name\)/i);
+});
+
+test('production-host validation accepts legitimate Supabase hosts and rejects local or random hosts', async () => {
+  assert.equal(isProductionDatabaseHost('db.project-ref.supabase.co'), true);
+  assert.equal(isProductionDatabaseHost('aws-0-us-east-1.pooler.supabase.com'), true);
+  assert.equal(isProductionDatabaseHost('localhost'), false);
+  assert.equal(isProductionDatabaseHost('127.0.0.1'), false);
+  assert.equal(isProductionDatabaseHost('::1'), false);
+  assert.equal(isProductionDatabaseHost('example.com'), false);
+  assert.equal(isProductionDatabaseHost('internal-db.internal'), false);
+  assert.equal(isLoopbackHost('localhost'), true);
+  assert.equal(isLoopbackHost('127.0.0.1'), true);
+  assert.equal(isLoopbackHost('::1'), true);
+  assert.equal(getDatabaseHostnameFromUrl('postgresql://user:pass@db.project-ref.supabase.co:5432/postgres'), 'db.project-ref.supabase.co');
+  assert.equal(getDatabaseHostnameFromUrl('not a valid url'), null);
+  assert.equal(getDatabaseHostnameFromUrl('postgresql://localhost:5432/localdb'), 'localhost');
 });
 
 test('runtime store requires DATABASE_URL and fails fast without it', async () => {
